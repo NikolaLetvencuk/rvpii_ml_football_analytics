@@ -1,0 +1,80 @@
+---
+title: "Analiza Airbnb smeštaja na osnovu oglasa"
+subtitle: "Računarstvo visokih performansi u informacionom inženjerstvu — praktični deo"
+author: "Nikola Letvenčuk, E2 46-2025"
+date: "`r format(Sys.Date(), '%d.%m.%Y.')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = normalizePath(".."))   # radni dir = koren projekta
+knitr::opts_chunk$set(
+  echo    = TRUE,      # specifikacija zahteva PRIKAZ programskog koda
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8, fig.height = 5, dpi = 150
+)
+```
+
+```{r ucitaj-funkcije}
+for (f in list.files("R", pattern = "[.][Rr]$", full.names = TRUE)) {
+  source(f, encoding = "UTF-8")
+}
+```
+
+# Korišćeni podaci i tehnologije
+
+<!-- specificiranje korišćenih podataka i tehnologija -->
+<!-- Poreklo (Inside Airbnb), licenca, obim u GB, broj oglasa i obeležja.
+     Tehnologije: R x.y.z, data.table, tidymodels/ranger/xgboost/e1071,
+     cluster, ggplot2, rmarkdown. Hardver i paralelizacija. -->
+
+# Priprema podataka
+
+<!-- učitavanje / uređivanje / nedostajuće vrednosti -->
+
+# Preliminarna analiza podataka
+
+## Deskriptivne statistike
+
+## Raspodele po obeležjima
+
+## Odnosi između obeležja
+
+# Klasifikacija
+
+## Random Forest
+
+### Scenario 1 · Scenario 2 · Scenario 3
+
+## XGBoost
+
+## SVM
+
+## Poređenje metoda i izbor rešenja
+
+<!-- odnos parametara i performansi + izabrano rešenje po metodu i ukupno -->
+
+# Klasterizacija
+
+## Scenario A
+
+## Scenario B
+
+## Struktura klastera i tumačenje
+
+# Zaključak
+
+# Reproducibilnost
+
+```{r sesija}
+sessionInfo()
+```

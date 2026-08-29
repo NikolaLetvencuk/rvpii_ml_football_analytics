@@ -1,0 +1,7 @@
+df <- read.csv("data/processed/player_features.csv")
+cat("dims:", dim(df), "\n")
+cat("NA position:", sum(is.na(df$position)), "\n")
+cat("NaN dribble_success_pct:", sum(is.nan(df$dribble_success_pct)), "\n")
+cat("NA anywhere per column:\n"); print(colSums(is.na(df)))
+print(sort(table(df$position), decreasing=TRUE))
+str(df)

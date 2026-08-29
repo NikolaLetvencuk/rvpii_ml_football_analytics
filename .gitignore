@@ -1,0 +1,22 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj.user
+
+# Podaci -- prevelicki za git, cuvaju se lokalno
+data/raw/*
+data/interim/*
+data/processed/*
+!data/*/.gitkeep
+
+# Generisani rezultati
+outputs/models/*
+outputs/logs/*
+!outputs/*/.gitkeep
+
+# Renderovan izvestaj
+reports/*.html
+reports/*.pdf
+reports/*_files/
+reports/*_cache/
