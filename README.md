@@ -1,103 +1,103 @@
-# Klasterizacija i klasifikacija fudbalskih igrača na osnovu StatsBomb podataka
+# Clustering and Classification of Football Players from StatsBomb Data
 
-Analiza stila i pozicija fudbalskih igrača primenom mašinskog učenja nad
-StatsBomb Open Data skupom, u jeziku R. Projekat za predmet
-*Računarstvo visokih performansi u informacionom inženjeringu* (FTN Novi Sad).
+Analysis of football players' playing styles and positions using machine
+learning on the StatsBomb Open Data set, in R. Project for the course
+*High Performance Computing in Information Engineering* (FTN Novi Sad).
 
-## Skup podataka
+## Dataset
 
-- **Izvor:** [StatsBomb Open Data](https://github.com/statsbomb/open-data) —
-  slobodno i javno dostupan, bez procedura za pristup (nekomercijalna,
-  istraživačka upotreba uz navođenje izvora).
-- **Priroda:** detaljni podaci o događajima (event data) — svaki zapis je
-  jedna akcija na terenu (dodavanje, šut, dribl, pritisak, oduzimanje...) sa
-  koordinatama, igračem, timom, ishodom i xG.
-- **Obim:** preko 350 utakmica iz 4 lige (Premier League, La Liga, Ligue 1,
-  Serie A), > 1 GB u JSON formatu (~1,3 miliona događaja).
+- **Source:** [StatsBomb Open Data](https://github.com/statsbomb/open-data) —
+  freely and publicly available, with no access procedures (non-commercial,
+  research use with attribution).
+- **Nature:** detailed event data — each record is one on-pitch action
+  (pass, shot, dribble, pressure, ball recovery...) with coordinates, player,
+  team, outcome, and xG.
+- **Size:** 350+ matches from 4 leagues (Premier League, La Liga, Ligue 1,
+  Serie A), > 1 GB in JSON format (~1.3 million events).
 
-## Tehnologije
+## Technologies
 
-- **R** — kompletna obrada, analiza i modelovanje
-- **Markdown** — izveštavanje
-- Paketi: `jsonlite`, `dplyr`, `tidyr`, `readr`, `ggplot2`, `graphics`,
+- **R** — full pipeline: processing, analysis, and modeling
+- **Markdown** — reporting
+- Packages: `jsonlite`, `dplyr`, `tidyr`, `readr`, `ggplot2`, `graphics`,
   `caret`, `class`, `rpart`, `rpart.plot`, `randomForest`, `cluster`,
   `factoextra`
 
-## Struktura projekta
+## Project structure
 
 ```
 projekat/
 ├── data/
-│   ├── raw/statsbomb/events/        # 356 sirovih JSON fajlova (~1 GB)
-│   ├── raw/statsbomb/matches/       # metapodaci o utakmicama
-│   └── processed/                   # obrađene tabele (CSV)
+│   ├── raw/statsbomb/events/        # 356 raw JSON files (~1 GB)
+│   ├── raw/statsbomb/matches/       # match metadata
+│   └── processed/                   # processed tables (CSV)
 ├── scripts/
-│   ├── 00_prikupljanje_podataka.R   # preuzimanje event podataka
-│   ├── 01_build_feature_table.R     # JSON -> tabela obeležja po igraču
-│   ├── 02_priprema_i_analiza.R      # priprema + preliminarna analiza
-│   ├── 04_klasifikacija.R           # KNN, stablo, random forest
-│   └── 05_klasterizacija.R          # k-Means
-├── figures/                         # generisani grafikoni
+│   ├── 00_data_collection.R         # download event data
+│   ├── 01_build_feature_table.R     # JSON -> per-player feature table
+│   ├── 02_prep_and_analysis.R       # preparation + preliminary analysis
+│   ├── 04_classification.R          # KNN, decision tree, random forest
+│   └── 05_clustering.R              # k-Means
+├── figures/                         # generated plots
 └── README.md
 ```
 
-## Tok rada i status
+## Workflow and status
 
-### ✅ Prikupljanje podataka (`00`)
-Preuzeto 356 utakmica (round-robin po ligama) do ~1 GB event podataka.
+### ✅ Data collection (`00`)
+Downloaded 356 matches (round-robin across leagues) up to ~1 GB of event data.
 
-### ✅ Formiranje tabele obeležja (`01`)
-Parsiranje i agregacija ~1,3M događaja u tabelu na nivou igrača:
-**770 igrača × 25+ numeričkih obeležja**, normalizovanih na 90 minuta
-(dodavanja, šutevi, xG, driblinzi, pritisci, oduzimanja, tackles...).
-Filtriran minimum od 450 minuta. Izlaz: `data/processed/player_features.csv`.
+### ✅ Feature table construction (`01`)
+Parsing and aggregation of ~1.3M events into a per-player table:
+**770 players × 25+ numeric features**, normalized per 90 minutes
+(passes, shots, xG, dribbles, pressures, ball recoveries, tackles...).
+Minimum 450 minutes filter applied. Output: `data/processed/player_features.csv`.
 
-### ✅ Priprema i preliminarna analiza (`02`)
-- učitavanje i uređivanje (tipovi, faktori)
-- ispitivanje nedostajućih vrednosti (nema pravih NA; obeležja su brojači,
-  pa izostanak akcije daje 0; jedini slučaj 0/0 kod stopa uspešnosti
-  postavljen na 0 uz napomenu)
-- deskriptivne statistike po obeležjima
-- vizualizacija raspodela (histogram, gustina, boxplot, Q-Q, bar) —
-  `graphics` i `ggplot2`
-- ispitivanje odnosa obeležja (scatter, korelaciona matrica)
+### ✅ Preparation and preliminary analysis (`02`)
+- loading and tidying (types, factors)
+- missing-value inspection (no true NAs; features are counters, so absence of
+  an action yields 0; the only 0/0 case in success-rate features is set to 0
+  with a note)
+- descriptive statistics per feature
+- distribution visualization (histogram, density, boxplot, Q-Q, bar chart) —
+  both `graphics` and `ggplot2`
+- feature relationships (scatter plots, correlation matrix)
 
-Izlaz: `data/processed/player_features_clean.csv`, `figures/`
+Output: `data/processed/player_features_clean.csv`, `figures/`
 
-### ✅ Klasifikacija [15p] (`04`)
-Ciljno obeležje: **poziciona grupa (6 klasa: GK/CB/FB/DM_CM/AM_W/FW)**.
-Tri metode, svaka sa 3 scenarija parametara:
-- **KNN** — parametar `k` (1 / 15 / 50)
-- **Stablo odlučivanja** — parametar `cp` (0 / 0.01 / 0.05)
-- **Random Forest** — parametar `mtry` (2 / √p / p)
+### ✅ Classification [15p] (`04`)
+Target: **position group (6 classes: GK/CB/FB/DM_CM/AM_W/FW)**.
+Three methods, each with 3 parameter scenarios:
+- **KNN** — parameter `k` (1 / 15 / 50)
+- **Decision Tree** — parameter `cp` (0 / 0.01 / 0.05)
+- **Random Forest** — parameter `mtry` (2 / √p / p)
 
-Ocena: 10-fold unakrsna validacija, pokazatelji ACC/PREC/SENS/SPEC/F1
-(makro-prosek), odnos parametara i performansi, izbor najboljeg rešenja
-po metodi i ukupno. Izlaz: `data/processed/classification_results.csv`
+Evaluation: 10-fold cross-validation, metrics ACC/PREC/SENS/SPEC/F1
+(macro-averaged), parameter-vs-performance relationship, selection of the best
+solution per method and overall. Output: `data/processed/classification_results.csv`
 
-### ✅ Klasterizacija [6p] (`05`)
-**k-Means**, dva scenarija broja klastera (k), ispitivanje strukture
-klastera (profili, silueta, poređenje sa pozicijama), vizualizacija
-odnosa obeležja i pripadnosti klasteru.
-Izlaz: `data/processed/player_clusters.csv`
+### ✅ Clustering [6p] (`05`)
+**k-Means**, two scenarios for the number of clusters (k), examination of
+cluster structure (profiles, silhouette, comparison against positions),
+visualization of the relationship between feature values and cluster membership.
+Output: `data/processed/player_clusters.csv`
 
-## Pokretanje
+## Running
 
-Redosled (iz korenskog foldera projekta):
+Order (from the project root folder):
 
 ```bash
-Rscript scripts/00_prikupljanje_podataka.R   # ~1 GB, traje duže
-Rscript scripts/01_build_feature_table.R     # parsiranje JSON-a
-Rscript scripts/02_priprema_i_analiza.R
-Rscript scripts/04_klasifikacija.R
-Rscript scripts/05_klasterizacija.R
+Rscript scripts/00_data_collection.R      # ~1 GB, takes a while
+Rscript scripts/01_build_feature_table.R  # JSON parsing
+Rscript scripts/02_prep_and_analysis.R
+Rscript scripts/04_classification.R
+Rscript scripts/05_clustering.R
 ```
 
-> Napomena: skripte `04` i `05` imaju parametre koji se biraju na osnovu
-> pomoćnih grafikona (elbow/silhouette za k, k-vs-tačnost za KNN) — pokrenuti
-> jednom, pogledati grafikone, po potrebi podesiti i pokrenuti ponovo.
+> Note: scripts `04` and `05` have parameters chosen based on helper plots
+> (elbow/silhouette for k, k-vs-accuracy for KNN) — run once, inspect the
+> plots, adjust if needed, and run again.
 
-## Preostalo
+## Remaining
 
-- [ ] Interpretacija rezultata i imenovanje klastera (arhetipovi)
-- [ ] Finalni Markdown izveštaj
+- [ ] Interpretation of results and naming of clusters (archetypes)
+- [ ] Final Markdown report
