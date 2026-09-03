@@ -1,0 +1,2 @@
+"metod","scenario","cv_f1","test_tacnost","test_kappa","makro_preciznost","makro_odziv","makro_f1","bal_tacnost","vreme_s"
+"Stablo odlucivanja","S3",0.8857,0.9123,0.8926,0.9276,0.9191,0.9226,0.9504,354.2

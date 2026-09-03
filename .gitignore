@@ -9,6 +9,7 @@ data/raw/*
 data/interim/*
 data/processed/*
 !data/*/.gitkeep
+data/*
 
 # Generisani rezultati
 outputs/models/*
