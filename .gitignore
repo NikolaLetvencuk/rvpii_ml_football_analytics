@@ -21,3 +21,4 @@ reports/*.html
 reports/*.pdf
 reports/*_files/
 reports/*_cache/
+logs/
