@@ -1,4 +1,4 @@
-library(sparklyr); library(dplyr); library(ggplot2);
+library(sparklyr); library(dplyr); library(ggplot2); library(tidyr)
 
 PROJEKAT <- normalizePath(".", winslash = "/", mustWork = TRUE)
 sp <- function(p) paste0("file:///", file.path(PROJEKAT, p, fsep = "/"))
@@ -9,6 +9,7 @@ sc <- spark_connect(master = "local[*]", version = "3.5", config = conf)
 
 dir.create("results", showWarnings = FALSE)
 dir.create("figures", showWarnings = FALSE)
+
 
 feat_cols <- readRDS("results/feat_cols.rds")
 train <- spark_read_parquet(sc, "train", sp("data/interim/train"))
@@ -22,25 +23,29 @@ base_pipeline <- ml_pipeline(sc) %>%
   ft_vector_assembler(input_cols = feat_cols, output_col = "features_raw") %>%
   ft_standard_scaler("features_raw", "features", with_mean = TRUE, with_std = TRUE)
 
-pipe_dt <- base_pipeline %>%
-  ml_decision_tree_classifier(features_col = "features", label_col = "label")
+pipe_rf <- base_pipeline %>%
+  ml_random_forest_classifier(features_col = "features", label_col = "label",
+                              seed = 42)
 
 evaluator <- ml_multiclass_classification_evaluator(
   sc, label_col = "label", prediction_col = "prediction", metric_name = "f1")
 
 run_cv <- function(grid) {
-  cv <- ml_cross_validator(sc, estimator = pipe_dt, estimator_param_maps = grid,
+  cv <- ml_cross_validator(sc, estimator = pipe_rf, estimator_param_maps = grid,
                            evaluator = evaluator, num_folds = 10,
                            parallelism = 4, seed = 42)
   ml_fit(cv, train)
 }
 
 
-g1 <- list(decision_tree = list(max_depth = c(2,3,5,8,12,20)))
-g2 <- list(decision_tree = list(min_instances_per_node = c(1,5,10,20,50),
-                                min_info_gain = c(0, 0.001, 0.01)))
-g3 <- list(decision_tree = list(impurity = c("gini","entropy"),
-                                max_depth = c(5,10,15)))
+# S1: num of trees
+# S2: depth of threes combined with how many attributes we use in each tree
+# S3: part of the data that we see and max instances per node
+g1 <- list(random_forest = list(num_trees = c(20, 50, 100, 250, 500)))
+g2 <- list(random_forest = list(max_depth = c(3, 5, 10, 15),
+                                feature_subset_strategy = c("sqrt","log2","onethird")))
+g3 <- list(random_forest = list(subsampling_rate = c(0.6, 0.8, 1.0),
+                                min_instances_per_node = c(1, 5, 20)))
 
 t1 <- system.time(cv1 <- run_cv(g1))
 t2 <- system.time(cv2 <- run_cv(g2))
@@ -50,43 +55,47 @@ vm1 <- ml_validation_metrics(cv1) %>% arrange(desc(f1))
 vm2 <- ml_validation_metrics(cv2) %>% arrange(desc(f1))
 vm3 <- ml_validation_metrics(cv3) %>% arrange(desc(f1))
 
-cat("\nS1: depth\n");        print(vm1, row.names = FALSE)
-cat("\nS2: stopping criteria\n");  print(vm2, row.names = FALSE)
-cat("\nS3: impurity criteria\n");   print(vm3, row.names = FALSE)
-cat("\nColumn names:\n")
+cat("\nS1:\n");                    
+print(vm1, row.names = FALSE)
+cat("\nS2:\n");        
+print(vm2, row.names = FALSE)
+cat("\nS3:\n");     
+print(vm3, row.names = FALSE)
+cat("\nNazivi kolona:\n")
 print(colnames(vm1)); print(colnames(vm2)); print(colnames(vm3))
-cat("\nTime (s):", round(c(t1[3], t2[3], t3[3]), 1), "\n")
+cat("\nVreme (s):", round(c(t1[3], t2[3], t3[3]), 1), "\n")
 
-write.csv(vm1, "results/dt_scenario1.csv", row.names = FALSE)
-write.csv(vm2, "results/dt_scenario2.csv", row.names = FALSE)
-write.csv(vm3, "results/dt_scenario3.csv", row.names = FALSE)
+write.csv(vm1, "results/rf_scenario1.csv", row.names = FALSE)
+write.csv(vm2, "results/rf_scenario2.csv", row.names = FALSE)
+write.csv(vm3, "results/rf_scenario3.csv", row.names = FALSE)
 
 
 pick <- function(vm, pat) names(vm)[grepl(pat, names(vm), ignore.case = TRUE)][1]
 
-ggplot(vm1, aes(.data[[pick(vm1,"max_depth")]], f1)) +
+ggplot(vm1, aes(.data[[pick(vm1,"num_trees")]], f1)) +
   geom_line(linewidth = 0.8) + geom_point(size = 2.5) +
-  labs(title = "Max depth",
-       subtitle = "F1, cv with 10 groups",
-       x = "Max depth", y = "F1")
-ggsave("figures/DT_S1.png", width = 7, height = 4.5, dpi = 150)
+  labs(title = "Slucajna suma, scenario 1: broj stabala",
+       subtitle = "F1 mera, 10-struka unakrsna validacija",
+       x = "Broj stabala u ansamblu", y = "F1")
+ggsave("figures/RF_S1.png", width = 7, height = 4.5, dpi = 150)
 
-ggplot(vm2, aes(.data[[pick(vm2,"min_instances")]], f1,
-                color = factor(.data[[pick(vm2,"min_info_gain")]]))) +
+ggplot(vm2, aes(.data[[pick(vm2,"max_depth")]], f1,
+                color = .data[[pick(vm2,"feature_subset")]])) +
   geom_line(linewidth = 0.8) + geom_point(size = 2.5) +
-  labs(title = "Stopping criteria",
-       subtitle = "F1, cv with 10 groups",
-       x = "Min instances per node", y = "F1",
-       color = "Min. prirast\ninformacije")
-ggsave("figures/DT_S2.png", width = 7.5, height = 4.5, dpi = 150)
+  labs(title = "Slucajna suma, scenario 2: dubina i podskup obelezja",
+       subtitle = "F1 mera, 10-struka unakrsna validacija",
+       x = "Maksimalna dubina", y = "F1",
+       color = "Strategija\npodskupa")
+ggsave("figures/RF_S2.png", width = 7.5, height = 4.5, dpi = 150)
 
-ggplot(vm3, aes(.data[[pick(vm3,"max_depth")]], f1,
-                color = .data[[pick(vm3,"impurity")]])) +
+ggplot(vm3, aes(.data[[pick(vm3,"subsampling")]], f1,
+                color = factor(.data[[pick(vm3,"min_instances")]]))) +
   geom_line(linewidth = 0.8) + geom_point(size = 2.5) +
-  labs(title = "impurity criteria",
-       subtitle = "F1, cv with 10 groups",
-       x = "Max depth", y = "F1", color = "Criteria")
-ggsave("figures/DT_S3.png", width = 7.5, height = 4.5, dpi = 150)
+  labs(title = "Slucajna suma, scenario 3: uzorkovanje i velicina cvora",
+       subtitle = "F1 mera, 10-struka unakrsna validacija",
+       x = "Udeo uzorkovanja", y = "F1",
+       color = "Min. instanci\nu cvoru")
+ggsave("figures/RF_S3.png", width = 7.5, height = 4.5, dpi = 150)
 
 
 best_f1 <- c(S1 = max(vm1$f1), S2 = max(vm2$f1), S3 = max(vm3$f1))
@@ -95,7 +104,15 @@ print(round(best_f1, 4))
 best_scen  <- names(which.max(best_f1))
 best_cv    <- list(S1 = cv1, S2 = cv2, S3 = cv3)[[best_scen]]
 best_model <- best_cv$best_model
-cat("\nBest scenario:", best_scen, "| CV F1 =", round(max(best_f1), 4), "\n")
+cat("\nNajbolji scenario:", best_scen, "| CV F1 =", round(max(best_f1), 4), "\n")
+
+rf_stage <- ml_stage(best_model, 4)
+cat("num_trees:",   invoke(spark_jobj(rf_stage), "getNumTrees"), "\n")
+cat("max_depth:",   invoke(spark_jobj(rf_stage), "getMaxDepth"), "\n")
+cat("subset:",      invoke(spark_jobj(rf_stage), "getFeatureSubsetStrategy"), "\n")
+cat("subsampling:", invoke(spark_jobj(rf_stage), "getSubsamplingRate"), "\n")
+cat("min_inst:",    invoke(spark_jobj(rf_stage), "getMinInstancesPerNode"), "\n")
+cat("ukupno cvorova u ansamblu:", invoke(spark_jobj(rf_stage), "totalNumNodes"), "\n")
 
 
 map_lab <- ml_transform(best_model, train) %>%
@@ -112,17 +129,25 @@ cm <- caret::confusionMatrix(factor(preds$pred_group, levels = lvl),
                              factor(preds$position_group, levels = lvl))
 print(cm)
 
+
+
 pipe_best <- base_pipeline %>%
-  ml_decision_tree_classifier(features_col = "features", label_col = "label",
-                              impurity = "entropy", max_depth = 5)
+  ml_random_forest_classifier(
+    features_col = "features", label_col = "label", seed = 42,
+    num_trees               = invoke(spark_jobj(rf_stage), "getNumTrees"),
+    max_depth               = invoke(spark_jobj(rf_stage), "getMaxDepth"),
+    feature_subset_strategy = invoke(spark_jobj(rf_stage), "getFeatureSubsetStrategy"),
+    subsampling_rate        = invoke(spark_jobj(rf_stage), "getSubsamplingRate"),
+    min_instances_per_node  = invoke(spark_jobj(rf_stage), "getMinInstancesPerNode"))
 
 t_fit  <- system.time(final_model <- ml_fit(pipe_best, train))
 t_pred <- system.time(ml_transform(final_model, test) %>% sdf_nrow())
 
-n_modela <- (6 + 15 + 6) * 10 + 3
+n_modela <- (5 + 12 + 9) * 10 + 3
 cat("\nObucavanje jednog modela:", round(t_fit[3], 3), "s\n")
 cat("Predvidjanje nad test skupom:", round(t_pred[3], 3), "s\n")
 cat("Ukupno obucenih modela u pretrazi:", n_modela, "\n")
+
 
 probs <- ml_transform(best_model, test) %>%
   sdf_separate_column("probability", into = paste0("p", 0:5)) %>%
@@ -136,8 +161,9 @@ auc <- pROC::multiclass.roc(response = factor(probs$label, levels = 0:5),
                             predictor = pmat)
 cat("Viseklasni AUC (Hand-Till):", round(as.numeric(auc$auc), 4), "\n")
 
+
 metrike <- data.frame(
-  metod            = "Stablo odlucivanja",
+  metod            = "Slucajna suma",
   scenario         = best_scen,
   cv_f1            = round(max(best_f1), 4),
   test_tacnost     = round(cm$overall["Accuracy"], 4),
@@ -153,43 +179,43 @@ metrike <- data.frame(
   vreme_pretrage_s = round(sum(t1[3], t2[3], t3[3]), 1)
 )
 print(metrike)
-write.csv(metrike, "results/dt_best.csv", row.names = FALSE)
+write.csv(metrike, "results/rf_best.csv", row.names = FALSE)
 
 po_klasi <- as.data.frame(cm$byClass[, c("Precision","Recall","F1","Balanced Accuracy")])
 po_klasi$klasa <- gsub("Class: ", "", rownames(po_klasi))
 print(po_klasi, row.names = FALSE)
-write.csv(po_klasi, "results/dt_po_klasi.csv", row.names = FALSE)
+write.csv(po_klasi, "results/rf_po_klasi.csv", row.names = FALSE)
 
-write.csv(as.data.frame.matrix(cm$table), "results/dt_confusion.csv")
+write.csv(as.data.frame.matrix(cm$table), "results/rf_confusion.csv")
 
 as.data.frame(cm$table) %>%
   ggplot(aes(Reference, Prediction, fill = Freq)) +
   geom_tile() + geom_text(aes(label = Freq), color = "white", size = 4) +
-  scale_fill_gradient(low = "grey85", high = "steelblue4") +
-  labs(title = "Matrica konfuzije — stablo odlucivanja (test skup)",
+  scale_fill_gradient(low = "grey85", high = "darkgreen") +
+  labs(title = "Matrica konfuzije — slucajna suma (test skup)",
        x = "Stvarna klasa", y = "Predvidjena klasa")
-ggsave("figures/DT_confusion.png", width = 7, height = 5.5, dpi = 150)
+ggsave("figures/RF_confusion.png", width = 7, height = 5.5, dpi = 150)
 
-dt_stage <- ml_stage(best_model, 4)
-imp <- spark_jobj(dt_stage) %>% invoke("featureImportances") %>% invoke("toArray")
+
+imp <- spark_jobj(rf_stage) %>% invoke("featureImportances") %>% invoke("toArray")
 imp_df <- data.frame(obelezje = feat_cols, znacaj = round(imp, 4)) %>%
   arrange(desc(znacaj))
-print(head(imp_df, 12), row.names = FALSE)
-write.csv(imp_df, "results/dt_importance.csv", row.names = FALSE)
+print(head(imp_df, 15), row.names = FALSE)
+write.csv(imp_df, "results/rf_importance.csv", row.names = FALSE)
 
-cat("\nDubina:", invoke(spark_jobj(dt_stage), "depth"),
-    "| Broj cvorova:", invoke(spark_jobj(dt_stage), "numNodes"), "\n")
-
-writeLines(invoke(spark_jobj(dt_stage), "toDebugString"),
-           "results/dt_tree_structure.txt")
-
-write.csv(data.frame(indeks = 0:(length(feat_cols)-1), obelezje = feat_cols),
-          "results/dt_feature_index.csv", row.names = FALSE)
-
-head(imp_df, 12) %>%
+head(imp_df, 15) %>%
   ggplot(aes(reorder(obelezje, znacaj), znacaj)) +
-  geom_col(fill = "steelblue4") + coord_flip() +
-  labs(title = "Znacaj obelezja — stablo odlucivanja", x = NULL, y = "Znacaj")
-ggsave("figures/DT_importance.png", width = 7, height = 5, dpi = 150)
+  geom_col(fill = "darkgreen") + coord_flip() +
+  labs(title = "Znacaj obelezja — slucajna suma", x = NULL, y = "Znacaj")
+ggsave("figures/RF_importance.png", width = 7, height = 5.5, dpi = 150)
+
+if (file.exists("results/dt_importance.csv")) {
+  dt_imp <- read.csv("results/dt_importance.csv")
+  poredjenje <- merge(imp_df, dt_imp, by = "obelezje",
+                      suffixes = c("_suma", "_stablo")) %>%
+    arrange(desc(znacaj_suma))
+  print(head(poredjenje, 12), row.names = FALSE)
+  write.csv(poredjenje, "results/importance_poredjenje.csv", row.names = FALSE)
+}
 
 spark_disconnect(sc)

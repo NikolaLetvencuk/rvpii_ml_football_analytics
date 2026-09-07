@@ -1,12 +1,3 @@
-# =============================================================
-#  INPUT : data/raw/statsbomb/events/*.json
-#  OUTPUT: data/interim/events_flat/        (Parquet, L1)
-#          data/interim/player_features/    (Parquet, L2)
-#          data/processed/player_features_spark.csv
-#
-#  Key: player_id + team
-# =============================================================
-
 library(sparklyr)
 library(dplyr)
 
@@ -23,7 +14,6 @@ dir.create("data/interim",  recursive = TRUE, showWarnings = FALSE)
 dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
 
 
-# --- 1. Konekcija ----------------------------------------------
 conf <- spark_config()
 conf$`sparklyr.shell.driver-memory` <- "8G"
 conf$`spark.driver.maxResultSize`   <- "2G"
@@ -32,7 +22,6 @@ sc <- spark_connect(master = "local[*]", version = "3.5", config = conf)
 
 cat("Spark", as.character(spark_version(sc)), "| jezgara:", parallel::detectCores(), "\n")
 
-# --- 2. Ucitavanje JSON-a --------------------------------------
 t_read <- system.time({
   spark_read_json(sc, "raw", sp(EVENTS),
                   options = list(multiLine = "true"), memory = FALSE)
@@ -73,13 +62,6 @@ ev <- spark_read_parquet(sc, "ev_p", sp(OUT_L1))
 cat("Dogadjaja:", sdf_nrow(ev), "| utakmica:",
     ev %>% summarise(n = n_distinct(match_id)) %>% pull(n), "\n")
 
-
-# --- 3. Minuti po utakmici -------------------------------------
-# Ista logika kao u staroj skripti:
-#   kraj utakmice = max(minute) medju "Half End" dogadjajima
-#   starteri      = ceo mec
-#   izasli        = do minuta zamene
-#   usli          = od minuta zamene do kraja
 
 DBI::dbExecute(sc, "
   CREATE OR REPLACE TEMP VIEW match_end AS
@@ -123,7 +105,6 @@ DBI::dbExecute(sc, "
   GROUP BY player_id, team_name")
 
 
-# --- 4. Modalna pozicija (po igracu i timu) --------------------
 DBI::dbExecute(sc, "
   CREATE OR REPLACE TEMP VIEW pos_rank AS
   SELECT player_id, team_name, position_name, cnt, total,
@@ -144,7 +125,6 @@ DBI::dbExecute(sc, "
   FROM pos_rank WHERE rk = 1")
 
 
-# --- 5. Brojaci dogadjaja --------------------------------------
 DBI::dbExecute(sc, "
   CREATE OR REPLACE TEMP VIEW counts AS
   SELECT
@@ -186,7 +166,6 @@ DBI::dbExecute(sc, "
   GROUP BY player_id, team_name")
 
 
-# --- 6. Spajanje + normalizacija na 90 minuta ------------------
 cnt_fields <- c("passes","passes_completed","long_passes","key_passes","assists",
                 "carries","shots","goals","xg","dribbles","dribbles_completed",
                 "pressures","ball_recoveries","interceptions","clearances",
@@ -221,7 +200,6 @@ t_agg <- system.time({
 cat("Agregacija:", round(t_agg[["elapsed"]], 1), "s\n")
 
 
-# --- 7. Prikupljanje u R i CSV ---------------------------------
 d <- collect(spark_read_parquet(sc, "l2", sp(OUT_L2)))
 write.csv(d, OUT_CSV, row.names = FALSE)
 

@@ -1,0 +1,51 @@
+DecisionTreeClassificationModel: uid=decision_tree_classifier__7b304747_9d5a_48f3_9a76_62d61911d94a, depth=5, numNodes=33, numClasses=6, numFeatures=29
+  If (feature 23 <= -0.5186145852932433)
+   If (feature 11 <= -1.354959802130117)
+    Predict: 5.0
+   Else (feature 11 > -1.354959802130117)
+    If (feature 9 <= 0.4188332472882156)
+     Predict: 3.0
+    Else (feature 9 > 0.4188332472882156)
+     Predict: 0.0
+  Else (feature 23 > -0.5186145852932433)
+   If (feature 23 <= 0.5921802736511184)
+    If (feature 25 <= 0.5456643064137381)
+     If (feature 23 <= 0.26666767515210177)
+      If (feature 24 <= 0.832896012849315)
+       Predict: 0.0
+      Else (feature 24 > 0.832896012849315)
+       Predict: 2.0
+     Else (feature 23 > 0.26666767515210177)
+      If (feature 17 <= 0.9449410372404561)
+       Predict: 0.0
+      Else (feature 17 > 0.9449410372404561)
+       Predict: 1.0
+    Else (feature 25 > 0.5456643064137381)
+     If (feature 5 <= -0.2455795047036045)
+      If (feature 9 <= 1.279346598058245)
+       Predict: 2.0
+      Else (feature 9 > 1.279346598058245)
+       Predict: 0.0
+     Else (feature 5 > -0.2455795047036045)
+      If (feature 0 <= -0.1404571944553589)
+       Predict: 0.0
+      Else (feature 0 > -0.1404571944553589)
+       Predict: 2.0
+   Else (feature 23 > 0.5921802736511184)
+    If (feature 28 <= -0.8433166994133829)
+     If (feature 4 <= -0.19131996951169544)
+      Predict: 4.0
+     Else (feature 4 > -0.19131996951169544)
+      If (feature 28 <= -0.9349140797127379)
+       Predict: 4.0
+      Else (feature 28 > -0.9349140797127379)
+       Predict: 1.0
+    Else (feature 28 > -0.8433166994133829)
+     If (feature 27 <= 0.8977627366800045)
+      If (feature 3 <= 2.499501016587061)
+       Predict: 1.0
+      Else (feature 3 > 2.499501016587061)
+       Predict: 0.0
+     Else (feature 27 > 0.8977627366800045)
+      Predict: 1.0
+

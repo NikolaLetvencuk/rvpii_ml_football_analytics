@@ -1,0 +1,2 @@
+"metod","scenario","cv_f1","test_tacnost","test_kappa","makro_preciznost","makro_odziv","makro_f1","bal_tacnost","auc","vreme_fit_s","vreme_pred_s","broj_modela","vreme_pretrage_s"
+"KNN","S3",0.9292,0.9357,0.9214,0.9398,0.9447,0.9416,0.9658,0.9962,0.11,0.32,451,34.1

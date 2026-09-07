@@ -2,6 +2,7 @@ library(sparklyr); library(dplyr)
 PROJEKAT <- normalizePath(".", winslash = "/", mustWork = TRUE)
 sp <- function(p) paste0("file:///", file.path(PROJEKAT, p, fsep = "/"))
 conf <- spark_config(); conf$`sparklyr.shell.driver-memory` <- "8G"
+
 conf$spark.sql.shuffle.partitions <- 32
 sc <- spark_connect(master = "local[*]", version = "3.5", config = conf)
 set.seed(42)

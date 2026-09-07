@@ -1,32 +1,18 @@
-# ============================================================
-# 02 — Priprema podataka i preliminarna analiza (pojednostavljeno)
-# ============================================================
-
 library(readr)
 library(dplyr)
 library(tidyr)
 library(ggplot2)
 
-# napravi folder za slike
 dir.create("figures", showWarnings = FALSE)
 
-# ============================================================
-# 1) UCITAVANJE PODATAKA
-# ============================================================
 df <- read_csv("data/processed/player_features.csv")
 
 cat("Redovi:", nrow(df), " Kolone:", ncol(df), "\n")
 glimpse(df)
 
-# ============================================================
-# 2) UREDJIVANJE PODATAKA
-# ============================================================
-
-# kolone koje su labele/ID, sve ostale su numericka obelezja
 id_cols <- c("player_id", "player", "team", "position", "pos_purity", "minutes")
 feat_cols <- setdiff(names(df), id_cols)
 
-# ispravi tipove
 df$player_id <- as.character(df$player_id)
 df$position  <- as.factor(df$position)
 df$team      <- as.factor(df$team)
@@ -34,28 +20,16 @@ df$team      <- as.factor(df$team)
 cat("Broj numerickih obelezja:", length(feat_cols), "\n")
 cat("Broj pozicija:", nlevels(df$position), "\n")
 
-# ============================================================
-# 3) NEDOSTAJUCE VREDNOSTI
-# ============================================================
-
 cat("NA po koloni:\n")
 print(colSums(is.na(df)))
 cat("Ukupno NA:", sum(is.na(df)), "\n")
 
-# igraci koji nisu pokusali nijedan dribling (kod njih je uspesnost driblinga 0/0 -> 0)
 cat("Igraci bez ijednog driblinga:", sum(df$dribbles_p90 == 0), "\n")
 
-# nema pravih NA, pa je cist skup isti kao uredjeni
 write_csv(df, "data/processed/player_features_clean.csv")
 
-# ============================================================
-# 4) DESKRIPTIVNE STATISTIKE
-# ============================================================
-
-# osnovni pregled svih numerickih obelezja
 print(summary(df[feat_cols]))
 
-# tabela: mean, median, sd, min, max za svako obelezje
 desc <- df %>%
   select(all_of(feat_cols)) %>%
   pivot_longer(everything(), names_to = "obelezje", values_to = "vrednost") %>%
@@ -69,7 +43,6 @@ desc <- df %>%
   )
 print(as.data.frame(desc))
 
-# prosek kljucnih obelezja po poziciji
 by_pos <- df %>%
   group_by(position) %>%
   summarise(
@@ -80,12 +53,6 @@ by_pos <- df %>%
     xg_p90     = mean(xg_p90)
   )
 print(as.data.frame(by_pos))
-
-# ============================================================
-# 5) VIZUALIZACIJA RASPODELA
-# ============================================================
-
-# --- base graphics ---
 
 # histogram
 png("figures/hist_passes.png")
@@ -104,7 +71,7 @@ dev.off()
 
 # boxplot dodavanja po poziciji
 png("figures/box_passes_by_pos.png", width = 2000, height = 1100, res = 150)
-par(mar = c(10, 4, 3, 1))   # veci donji margin za rotirane nazive
+par(mar = c(10, 4, 3, 1))   
 boxplot(passes_p90 ~ position, data = df, las = 2,
         main = "Dodavanja/90 po poziciji", xlab = "", ylab = "Dodavanja / 90",
         col = "lightblue")
@@ -122,8 +89,6 @@ par(mar = c(11, 4, 3, 1))
 barplot(sort(table(df$position), decreasing = TRUE), las = 2,
         main = "Broj igraca po poziciji", ylab = "Broj igraca", col = "grey70")
 dev.off()
-
-# --- ggplot2 ---
 
 # histogram + density
 g1 <- ggplot(df, aes(x = passes_p90)) +
@@ -150,9 +115,6 @@ g3 <- ggplot(df, aes(x = position, y = passes_p90)) +
   labs(title = "Dodavanja/90 po poziciji", x = NULL, y = "Dodavanja / 90")
 ggsave("figures/gg_box_by_pos.png", g3)
 
-# ============================================================
-# 6) ODNOSI IZMEDJU OBELEZJA
-# ============================================================
 
 # scatter (base): pritisci vs tackles
 png("figures/scatter_press_tackles.png")

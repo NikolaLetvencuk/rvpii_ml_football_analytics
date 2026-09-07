@@ -1,0 +1,2364 @@
+---
+title: "Player Analysis — StatsBomb Open Data"
+subtitle: "Data preparation, preliminary analysis, classification and clustering"
+author: "Nikola"
+date: "`r format(Sys.Date(), '%d.%m.%Y.')`"
+lang: en
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    df_print: kable
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,         # the code is shown next to every section
+  eval = FALSE,        # the code is NOT executed at knit time (Spark is not started)
+  message = FALSE,
+  warning = FALSE,
+  out.width = "100%",
+  fig.align = "center"
+)
+```
+
+```{r loading, include=FALSE, eval=TRUE}
+# This block IS executed at knit time. It does not start Spark and does not
+# recompute the models — it only loads the results that the scripts have already
+# written into the results/ directory. This keeps the report fast to knit, while
+# the numbers in it come from an actual run rather than from manual transcription.
+
+for (p in c("readr", "dplyr", "knitr", "kableExtra")) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+library(readr); library(dplyr); library(knitr); library(kableExtra)
+
+# The result files live either directly in results/ or in a per-method
+# subdirectory, so the loader searches the known locations in order.
+result_dirs <- c("results", "results/decision_tree", "results/random_forest",
+                 "results/knn", "results/km", "results/decision_tree_old")
+
+load_csv <- function(name) {
+  for (d in result_dirs) {
+    p <- file.path(d, name)
+    if (file.exists(p)) return(read_csv(p, show_col_types = FALSE))
+  }
+  NULL
+}
+
+tab <- function(x, caption = NULL, digits = 4) {
+  if (is.null(x)) return(invisible(NULL))
+  kable(x, digits = digits, caption = caption, booktabs = TRUE) |>
+    kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                  full_width = FALSE, position = "center")
+}
+
+dt_s1 <- load_csv("dt_scenario1.csv")
+dt_s2 <- load_csv("dt_scenario2.csv")
+dt_s3 <- load_csv("dt_scenario3.csv")
+rf_s1 <- load_csv("rf_scenario1.csv")
+rf_s2 <- load_csv("rf_scenario2.csv")
+rf_s3 <- load_csv("rf_scenario3.csv")
+knn_s1 <- load_csv("knn_scenario1.csv")
+knn_s2 <- load_csv("knn_scenario2.csv")
+knn_s3 <- load_csv("knn_scenario3.csv")
+
+dt_best  <- load_csv("dt_best.csv")
+rf_best  <- load_csv("rf_best.csv")
+knn_best <- load_csv("knn_best.csv")
+km_best  <- load_csv("km_best.csv")
+
+dt_by_class  <- load_csv("dt_po_klasi.csv")
+rf_by_class  <- load_csv("rf_po_klasi.csv")
+knn_by_class <- load_csv("knn_po_klasi.csv")
+
+descriptives <- load_csv("deskriptiva.csv")
+comparison   <- load_csv("poredjenje_metoda.csv")
+imp_all      <- load_csv("importance_sve_metode.csv")
+
+km_s1        <- load_csv("km_scenario1.csv")
+km_s2        <- load_csv("km_scenario2.csv")
+km_crosstab  <- load_csv("km_ukrstena.csv")
+km_features  <- load_csv("km_obelezja_f.csv")
+km_stab      <- load_csv("km_stabilnost.csv")
+km_centroids <- load_csv("km_centroidi_original.csv")
+```
+
+> **A note on the code in this report.** Every section is accompanied by the
+> snippets of code that carried out the step in question. Blocks that start Spark
+> are marked `eval = FALSE`, so they are not executed at knit time — the tables
+> are read from `results/` and the figures from `figures/`. The complete scripts
+> are given in the appendix at the end.
+
+# Data
+
+The data was downloaded from the StatsBomb Open Data repository by the script
+`scripts/00_preuzmi_podatke.R`. For each of the four leagues (Premier League,
+La Liga, Ligue 1, Serie A) the season with the largest number of matches is
+chosen, and the download proceeds in an alternating (round-robin) fashion so
+that the leagues are evenly represented. In total **1,517 matches** were
+downloaded, i.e. **4.25 GB** of raw JSON files, one file per match. Match-level
+metadata is kept in `all_matches_meta.csv`, while
+`downloaded_matches_manifest.csv` (1,517 rows) contains only the matches that
+were actually downloaded and is used as the reference when loading. After
+parsing, the dataset contains **5,321,459 event records** and 18 features.
+
+The data was used in accordance with the StatsBomb Open Data licence
+(non-commercial, research use with mandatory attribution).
+
+## Season selection and download
+
+For each league the season with the largest number of played matches is chosen:
+
+```{r code-season-selection}
+base_url <- "https://raw.githubusercontent.com/statsbomb/open-data/master/data"
+target_leagues <- c("Premier League", "La Liga", "Ligue 1", "Serie A")
+
+competitions <- fromJSON(file.path(base_url, "competitions.json"))
+cand <- competitions[competitions$competition_name %in% target_leagues, ]
+
+get_match_count <- function(comp_id, season_id) {
+  url <- sprintf("%s/matches/%s/%s.json", base_url, comp_id, season_id)
+  tryCatch(nrow(fromJSON(url)), error = function(e) NA_integer_)
+}
+cand$n_matches <- mapply(get_match_count, cand$competition_id, cand$season_id)
+
+best_season <- do.call(rbind, lapply(split(cand, cand$competition_name), function(df) {
+  df[which.max(df$n_matches), ]
+}))
+```
+
+The download alternates between leagues, counting bytes and skipping files that
+have already been fetched, which makes the procedure interruptible and
+resumable:
+
+```{r code-download}
+target_bytes <- 5 * 1024^3
+downloaded_bytes <- 0
+max_n <- max(sapply(match_lists, nrow))
+
+for (row in seq_len(max_n)) {
+  if (downloaded_bytes >= target_bytes) break
+  for (league in names(match_lists)) {           # round-robin across leagues
+    if (downloaded_bytes >= target_bytes) break
+    m <- match_lists[[league]]
+    if (row > nrow(m)) next                      # this league has run out of matches
+
+    match_id <- m$match_id[row]
+    dest <- file.path(events_dir, paste0(match_id, ".json"))
+    if (file.exists(dest)) {                     # resuming an interrupted download
+      downloaded_bytes <- downloaded_bytes + file.info(dest)$size
+      next
+    }
+    ok <- tryCatch({
+      download.file(sprintf("%s/events/%s.json", base_url, match_id),
+                    dest, quiet = TRUE, mode = "wb"); TRUE
+    }, error = function(e) FALSE)
+
+    fsize <- if (ok && file.exists(dest)) file.info(dest)$size else 0
+    if (fsize == 0) unlink(dest) else downloaded_bytes <- downloaded_bytes + fsize
+    Sys.sleep(0.05)
+  }
+}
+```
+
+# Data processing in Spark
+
+## Execution environment
+
+The analysis was carried out in **Apache Spark 3.5.8** (Hadoop 3), installed
+locally through the `sparklyr` package and started in `local[*]` mode, where a
+single JVM process takes on the role of both driver and executor and uses all
+available cores. The driver was given 8 GB of memory, the limit on the result
+returned to the R session is 2 GB, and the number of partitions used in shuffle
+operations was reduced from the default 200 to 32, which is more appropriate for
+this data volume on a single machine.
+
+```{r spark-conf}
+PROJECT <- normalizePath(".", winslash = "/", mustWork = TRUE)
+sp <- function(p) paste0("file:///", file.path(PROJECT, p, fsep = "/"))
+
+conf <- spark_config()
+conf$`sparklyr.shell.driver-memory` <- "8G"
+conf$spark.driver.maxResultSize     <- "2G"
+conf$spark.sql.shuffle.partitions   <- 32
+sc <- spark_connect(master = "local[*]", version = "3.5", config = conf)
+```
+
+The helper function `sp()` exists because Spark runs on the JVM and expects a
+URI rather than a Windows path; `normalizePath` yields an absolute path, and the
+`file:///` prefix tells Spark to read from the local file system.
+
+Packages used: `sparklyr` for working with Spark, `dplyr`, `tidyr` and `readr`
+for processing, `ggplot2` and `dbplot` for visualisation, `caret` for the
+confusion matrix and stratified folds, `kknn` for the k-nearest-neighbours
+method, `pROC` for multiclass AUC, `cluster` for silhouette analysis and
+`e1071` for the skewness coefficient.
+
+## Loading and flattening the JSON structure
+
+Processing takes place in two layers. First all JSON files are loaded and, by
+flattening the nested structure, the Parquet dataset `data/interim/events_flat`
+is formed, in which one row corresponds to one event. The match identifier is
+extracted from the file name, since the records themselves do not contain it.
+
+```{r code-json}
+spark_read_json(sc, "raw", sp("data/raw/statsbomb/events"),
+                options = list(multiLine = "true"), memory = FALSE)
+
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW raw_id AS
+  SELECT *,
+         CAST(regexp_extract(input_file_name(), '([0-9]+)\\.json$', 1) AS INT) AS match_id
+  FROM raw")
+
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW ev AS
+  SELECT match_id, minute, second,
+         type.name              AS event_type,
+         player.id              AS player_id,
+         player.name            AS player_name,
+         team.name              AS team_name,
+         position.name          AS position_name,
+         pass.outcome.name      AS pass_outcome,
+         pass.length            AS pass_length,
+         pass.goal_assist       AS pass_goal_assist,
+         pass.shot_assist       AS pass_shot_assist,
+         shot.statsbomb_xg      AS shot_xg,
+         shot.outcome.name      AS shot_outcome,
+         dribble.outcome.name   AS dribble_outcome,
+         duel.type.name         AS duel_type,
+         location[0]            AS loc_x,
+         location[1]            AS loc_y
+  FROM raw_id")
+
+spark_write_parquet(tbl(sc, "ev"), sp("data/interim/events_flat"), mode = "overwrite")
+```
+
+## Computing minutes played
+
+Minutes played are reconstructed from three types of administrative event. The
+end of a match is the maximum time among the *Half End* records, which also
+covers stoppage time. Starters play until they are substituted off or until the
+end, substitutes from the moment they come on until the end. Only players with
+at least **450 minutes played** are included in the analysis.
+
+```{r code-minutes}
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW match_end AS
+  SELECT match_id, MAX(minute + second/60.0) AS end_min
+  FROM raw_id WHERE type.name = 'Half End' GROUP BY match_id")
+
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW starters AS
+  SELECT r.match_id, p.player.id AS player_id, r.team.name AS team_name
+  FROM raw_id r
+  LATERAL VIEW explode(r.tactics.lineup) lu AS p
+  WHERE r.type.name = 'Starting XI'")
+
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW subs AS
+  SELECT match_id, player.id AS off_id,
+         substitution.replacement.id AS on_id,
+         team.name AS team_name, minute + second/60.0 AS sub_min
+  FROM raw_id WHERE type.name = 'Substitution'")
+
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW minutes_match AS
+  SELECT s.match_id, s.player_id, s.team_name,
+         COALESCE(sb.sub_min, m.end_min) AS mins     -- starter: until substituted off or until the end
+  FROM starters s
+  JOIN match_end m ON m.match_id = s.match_id
+  LEFT JOIN subs sb ON sb.match_id = s.match_id AND sb.off_id = s.player_id
+  UNION ALL
+  SELECT sb.match_id, sb.on_id, sb.team_name,
+         m.end_min - sb.sub_min AS mins              -- substitute: from coming on until the end
+  FROM subs sb JOIN match_end m ON m.match_id = sb.match_id")
+```
+
+## Aggregation into counters and normalisation
+
+All counters are formed in a **single pass** over the event layer, by
+conditional summation per event type. The key is the player–team combination, so
+a player who changed clubs produces two separate rows.
+
+```{r code-counters}
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW counts AS
+  SELECT player_id, team_name, MAX(player_name) AS player,
+    SUM(CASE WHEN event_type='Pass' THEN 1 ELSE 0 END) AS passes,
+    SUM(CASE WHEN event_type='Pass' AND pass_outcome IS NULL THEN 1 ELSE 0 END) AS passes_completed,
+    SUM(CASE WHEN event_type='Pass' AND pass_length >= 30 THEN 1 ELSE 0 END) AS long_passes,
+    SUM(CASE WHEN pass_shot_assist = true THEN 1 ELSE 0 END) AS key_passes,
+    SUM(CASE WHEN pass_goal_assist = true THEN 1 ELSE 0 END) AS assists,
+    SUM(CASE WHEN event_type='Shot' THEN 1 ELSE 0 END) AS shots,
+    SUM(COALESCE(shot_xg, 0)) AS xg,
+    SUM(CASE WHEN event_type='Clearance' THEN 1 ELSE 0 END) AS clearances,
+    SUM(CASE WHEN event_type='Duel' AND duel_type='Tackle' THEN 1 ELSE 0 END) AS tackles,
+    -- ... the remaining counters have the same form ...
+    AVG(loc_x) AS mean_x, AVG(loc_y) AS mean_y,
+    STDDEV(loc_x) AS sd_x, STDDEV(loc_y) AS sd_y,
+    SUM(CASE WHEN loc_x >= 80 THEN 1 ELSE 0 END) AS touches_f3,
+    SUM(CASE WHEN loc_x <= 40 THEN 1 ELSE 0 END) AS touches_d3,
+    COUNT(*) AS n_events
+  FROM ev_p WHERE player_id IS NOT NULL
+  GROUP BY player_id, team_name")
+```
+
+The counters are then normalised to 90 minutes, and the query is generated
+programmatically so that 22 expressions do not have to be written by hand:
+
+```{r code-p90}
+cnt_fields <- c("passes","passes_completed","long_passes","key_passes","assists",
+                "carries","shots","goals","xg","dribbles","dribbles_completed",
+                "pressures","ball_recoveries","interceptions","clearances",
+                "blocks","duels","tackles","fouls","dispossessed","miscontrols",
+                "ball_receipts")
+
+p90_sql <- paste(sprintf("ROUND(c.%s / m.minutes * 90, 3) AS %s_p90",
+                         cnt_fields, cnt_fields), collapse = ",\n  ")
+
+final_sql <- sprintf("
+  SELECT c.player_id, c.player, c.team_name AS team,
+         p.position, p.pos_purity, ROUND(m.minutes, 1) AS minutes,
+         %s,
+         ROUND(c.passes_completed / GREATEST(c.passes, 1), 3)   AS pass_completion_pct,
+         ROUND(c.pass_length_sum  / GREATEST(c.passes, 1), 2)   AS avg_pass_length,
+         ROUND(c.mean_x, 2) AS mean_x, ROUND(c.mean_y, 2) AS mean_y,
+         ROUND(c.sd_x, 2)   AS sd_x,   ROUND(c.sd_y, 2)   AS sd_y,
+         ROUND(c.touches_f3 / c.n_events, 3) AS f3_share,
+         ROUND(c.touches_d3 / c.n_events, 3) AS d3_share
+  FROM counts c
+  JOIN minutes_total m ON m.player_id = c.player_id AND m.team_name = c.team_name
+  LEFT JOIN positions p ON p.player_id = c.player_id AND p.team_name = c.team_name
+  WHERE m.minutes >= %d", p90_sql, 450)
+
+feat <- sdf_sql(sc, final_sql)
+spark_write_parquet(sdf_repartition(feat, 1), sp("data/interim/player_features"),
+                    mode = "overwrite")
+```
+
+# Target feature and label quality
+
+The target feature was formed by mapping the detailed StatsBomb positions into
+six positional classes: **GK, CB, FB, DM_CM, AM_W, FW** (22 of the 24 possible
+positions appear in the dataset).
+
+```{r code-positions}
+position_group <- case_when(
+  position == "Goalkeeper" ~ "GK",
+  position %in% c("Right Center Back", "Left Center Back", "Center Back") ~ "CB",
+  position %in% c("Left Back", "Right Back",
+                  "Left Wing Back", "Right Wing Back") ~ "FB",
+  position %in% c("Right Defensive Midfield", "Left Defensive Midfield",
+                  "Center Defensive Midfield", "Right Center Midfield",
+                  "Left Center Midfield") ~ "DM_CM",
+  position %in% c("Right Wing", "Left Wing", "Center Attacking Midfield",
+                  "Right Attacking Midfield", "Right Midfield",
+                  "Left Midfield") ~ "AM_W",
+  position %in% c("Center Forward", "Right Center Forward",
+                  "Left Center Forward") ~ "FW"
+)
+```
+
+A player's position was determined as the **modal** one, while at the same time
+computing its **purity** — the share of events played in that position. A window
+function computes the total number of events as the denominator, and the ranking
+picks the most frequent position:
+
+```{r code-purity}
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW pos_rank AS
+  SELECT player_id, team_name, position_name, cnt, total,
+         ROW_NUMBER() OVER (PARTITION BY player_id, team_name ORDER BY cnt DESC) AS rk
+  FROM (
+    SELECT player_id, team_name, position_name,
+           COUNT(*) AS cnt,
+           SUM(COUNT(*)) OVER (PARTITION BY player_id, team_name) AS total
+    FROM ev_p
+    WHERE player_id IS NOT NULL AND position_name IS NOT NULL
+    GROUP BY player_id, team_name, position_name)")
+
+DBI::dbExecute(sc, "
+  CREATE OR REPLACE TEMP VIEW positions AS
+  SELECT player_id, team_name, position_name AS position,
+         ROUND(cnt / total, 3) AS pos_purity
+  FROM pos_rank WHERE rk = 1")
+```
+
+The first computation, over the detailed positions, gave a median of 0.676, with
+456 rows (27%) below 0.5. On closer inspection it was established that this is
+an artefact of the granularity of the feature rather than genuine ambiguity of
+the role: rotation between the left and the right centre-back counts as impurity
+even though the positional class stays the same. The measure was therefore
+recomputed over the six classes.
+
+| Aggregation level | Min | Q1 | Median | Mean | Q3 | Max | Share below 0.5 |
+|---|---|---|---|---|---|---|---|
+| 22 detailed positions | 0.194 | 0.487 | 0.676 | 0.687 | 0.923 | 1.000 | 456 (26.8%) |
+| 6 positional classes | 0.389 | 0.855 | 0.979 | 0.904 | 1.000 | 1.000 | 25 (1.5%) |
+
+At the level of six classes the median purity is 0.979, and three quarters of
+the players have a purity above 0.855, which confirms that the target feature is
+not noisy. The remaining 25 rows represent genuinely multi-positional players;
+they were not removed but kept and used when interpreting classification errors.
+
+```{r figure1, eval=TRUE, echo=FALSE, fig.cap="Figure 1: Conceptual division of the pitch by positional class"}
+knitr::include_graphics("figures/podela_pozicija.png")
+```
+
+# Missing value analysis
+
+The analysis was carried out over the event dataset (5,321,459 records, 18
+features) rather than over the derived player-level table, because aggregation
+into counters makes missing values disappear. The per-column profile is obtained
+with a single query, generated programmatically over the column names:
+
+```{r code-na-profile}
+cols <- colnames(ev)
+na_sql <- paste(sprintf("SUM(CASE WHEN %s IS NULL THEN 1 ELSE 0 END) AS %s", cols, cols),
+                collapse = ", ")
+na_prof <- sdf_sql(sc, sprintf("SELECT COUNT(*) AS n_total, %s FROM ev_p", na_sql)) %>%
+  collect()
+
+na_tbl <- data.frame(
+  column = cols,
+  n_na   = as.numeric(na_prof[1, cols]),
+  pct_na = round(100 * as.numeric(na_prof[1, cols]) / na_prof$n_total, 1)
+)
+na_tbl[order(-na_tbl$pct_na), ]
+```
+
+Five features have no missing values at all, while seven have a share above 70%.
+None of the missing values is the consequence of a collection error — they all
+fall into four categories:
+
+- **Structural absence** — `shot_xg`, `shot_outcome`, `dribble_outcome`,
+  `duel_type` and `pass_length` are defined only for the corresponding event
+  type. A check shows a perfect match: `shot_xg` is missing in 5,283,571
+  records, exactly as many as there are non-shot events, while among the 37,888
+  shots it is not missing in a single one.
+- **Semantic absence** — for `pass_outcome` a value is written only when the
+  pass failed, so NA denotes success. Of 1,481,813 passes, 1,136,687 have no
+  outcome recorded, which gives an accuracy of 76.7%. This is the only case in
+  which naively dropping such records would give an accuracy of 0% for every
+  player.
+- **Logical absence** — the boolean features `pass_goal_assist` and
+  `pass_shot_assist` are written only when the condition is satisfied (2,596
+  assists and 24,439 key passes).
+- **Administrative events** — *Half Start*, *Starting XI*, *Tactical Shift*:
+  20,393 (0.4%) records without a player and 37,460 (0.7%) without coordinates.
+
+The structural-absence hypothesis was checked by comparing across event types:
+
+```{r code-na-check}
+# confirmation that shot_xg is missing exactly where the event is not a shot
+sdf_sql(sc, "
+  SELECT event_type, COUNT(*) AS n,
+         ROUND(100.0 * SUM(CASE WHEN shot_xg IS NULL THEN 1 ELSE 0 END)/COUNT(*), 1) AS pct_na_xg,
+         ROUND(100.0 * SUM(CASE WHEN loc_x   IS NULL THEN 1 ELSE 0 END)/COUNT(*), 1) AS pct_na_loc,
+         ROUND(100.0 * SUM(CASE WHEN player_id IS NULL THEN 1 ELSE 0 END)/COUNT(*), 1) AS pct_na_player
+  FROM ev_p GROUP BY event_type ORDER BY n DESC") %>% collect()
+
+# confirmation that NA in pass_outcome means a completed pass
+ev %>% filter(!is.na(pass_outcome)) %>% count(pass_outcome, sort = TRUE) %>% collect()
+```
+
+No imputation method was applied. The counters were formed by conditional
+summation per event type (structural absence yields a zero), `pass_outcome IS
+NULL` was used as the definition of a completed pass, records without a player
+were excluded by a condition on the identifier, and `AVG` and `STDDEV` ignore
+missing coordinates. **The final player-level table contains no missing values
+at all.**
+
+# Preliminary analysis
+
+The analysis was carried out at two levels: over the event dataset (5,321,459
+records) in Spark and over the derived player-level table (1,702 rows) in R.
+The split follows the principle behind the `sparklyr` package — the processing
+is executed in Spark, and only aggregated results are collected into R.
+
+## Event level
+
+33 event types were recorded, with passes, ball receipts and carries accounting
+for 74.8% of all records.
+
+| event_type | n |
+|---|---|
+| Pass | 1,481,813 |
+| Ball Receipt* | 1,384,869 |
+| Carry | 1,117,196 |
+| Pressure | 491,104 |
+| Ball Recovery | 162,682 |
+| Duel | 125,123 |
+| Clearance | 73,006 |
+| Block | 59,169 |
+
+*Table 1: The most frequent event types*
+
+The **dbplot** package was used to visualise the distributions; it computes the
+binned distribution in Spark and transfers into R only the table of per-bin
+values, thereby avoiding the transfer of 1.48 million individual values.
+
+```{r code-dbplot}
+ev %>% filter(!is.na(pass_length)) %>%
+  dbplot_histogram(pass_length, bins = 60) +
+  labs(title = "Distribution of pass length",
+       subtitle = "1,481,813 passes, aggregation performed in Spark",
+       x = "Pass length (yards)", y = "Number of passes")
+ggsave("figures/A2_pass_length.png", width = 8, height = 5, dpi = 150)
+
+ev %>% filter(!is.na(loc_x), !is.na(loc_y)) %>%
+  dbplot_raster(loc_x, loc_y, resolution = 60) +
+  scale_fill_viridis_c() +
+  labs(title = "Touch density across the pitch", subtitle = "5.28 million records",
+       x = "Pitch length", y = "Pitch width")
+ggsave("figures/A3_heatmap.png", width = 9, height = 6, dpi = 150)
+```
+
+```{r a2, eval=TRUE, echo=FALSE, fig.cap="Figure 2: Histogram of pass length"}
+knitr::include_graphics("figures/A2_pass_length.png")
+```
+
+The distribution of pass length is markedly right-skewed, with a peak in the
+range of short passes and a tail corresponding to long balls and crosses.
+
+```{r a3, eval=TRUE, echo=FALSE, fig.cap="Figure 3: Touch density across the pitch"}
+knitr::include_graphics("figures/A3_heatmap.png")
+```
+
+For the display by positional class the coordinates were reduced to a grid with
+a step of four units, by integer division **inside the query**, which reduces
+the set of 5.28 million records to a few thousand aggregated cells before the
+transfer into R:
+
+```{r code-heatmap-positions}
+grid <- sdf_sql(sc, "
+  SELECT CASE
+    WHEN position_name='Goalkeeper' THEN 'GK'
+    WHEN position_name IN ('Right Center Back','Left Center Back','Center Back') THEN 'CB'
+    WHEN position_name IN ('Left Back','Right Back','Left Wing Back','Right Wing Back') THEN 'FB'
+    WHEN position_name IN ('Right Defensive Midfield','Left Defensive Midfield',
+         'Center Defensive Midfield','Right Center Midfield','Left Center Midfield') THEN 'DM_CM'
+    WHEN position_name IN ('Right Wing','Left Wing','Center Attacking Midfield',
+         'Right Attacking Midfield','Right Midfield','Left Midfield') THEN 'AM_W'
+    WHEN position_name IN ('Center Forward','Right Center Forward','Left Center Forward') THEN 'FW'
+  END AS pos_grp,
+  FLOOR(loc_x/4)*4 AS gx, FLOOR(loc_y/4)*4 AS gy, COUNT(*) AS n
+  FROM ev_p WHERE loc_x IS NOT NULL AND position_name IS NOT NULL
+  GROUP BY 1,2,3") %>% collect()
+
+grid$pos_grp <- factor(grid$pos_grp, levels = c("GK","CB","FB","DM_CM","AM_W","FW"))
+ggplot(grid, aes(gx, gy, fill = n)) + geom_tile() +
+  facet_wrap(~ pos_grp) + scale_fill_viridis_c(trans = "sqrt") +
+  labs(title = "Touch density by positional class", x = NULL, y = NULL)
+ggsave("figures/A4_heatmap_pozicije.png", width = 11, height = 7, dpi = 150)
+```
+
+```{r a4, eval=TRUE, echo=FALSE, fig.cap="Figure 4: Touch density by positional class"}
+knitr::include_graphics("figures/A4_heatmap_pozicije.png")
+```
+
+The display by class shows clearly delineated patterns: goalkeepers are
+exclusively inside their own penalty area, centre-backs in front of it,
+full-backs along the touchlines, midfielders have the most even distribution
+around the central axis, wingers repeat the full-backs' pattern but shifted
+towards the opposition half, and forwards are concentrated in the opposition
+penalty area. The differences are visible to the naked eye and constitute the
+first confirmation that the positional classes are separable from the data. The
+display also foreshadows where errors are to be expected: full-backs and wingers
+differ mainly in their position along the length of the pitch rather than in the
+shape of the pattern, while centre-backs and defensive midfielders overlap in
+front of their own penalty area.
+
+## Descriptive statistics and distributions
+
+For each of the 31 numeric features the mean, median, standard deviation,
+minimum, maximum and skewness coefficient were computed.
+
+```{r code-descriptives}
+d <- read.csv("data/processed/player_features_labeled.csv", stringsAsFactors = FALSE)
+d$position_group <- factor(d$position_group, levels = c("GK","CB","FB","DM_CM","AM_W","FW"))
+
+num <- names(d)[sapply(d, is.numeric)]
+num <- setdiff(num, c("player_id", "pos_purity", "purity6", "minutes"))
+
+desc <- data.frame(
+  obelezje   = num,
+  sredina    = sapply(d[num], mean),
+  medijana   = sapply(d[num], median),
+  sd         = sapply(d[num], sd),
+  min        = sapply(d[num], min),
+  max        = sapply(d[num], max),
+  asimetrija = sapply(d[num], e1071::skewness)
+)
+desc[, -1] <- round(desc[, -1], 3)
+write.csv(desc, "results/deskriptiva.csv", row.names = FALSE)
+```
+
+```{r descriptives-table, eval=TRUE, echo=FALSE}
+if (!is.null(descriptives)) {
+  descriptives |> arrange(desc(abs(asimetrija))) |> head(12) |>
+    tab("Table 2 — The twelve features with the most pronounced skewness", digits = 3)
+}
+```
+
+> Column names in the table: `obelezje` = feature, `sredina` = mean,
+> `medijana` = median, `asimetrija` = skewness.
+
+The correctness of the table was checked by comparing the extreme values against
+individual cases: the lowest pass completion is 0.391 and belongs to a
+goalkeeper, which matches the value from the preparation stage. The widest range
+belongs to `mean_x`, from 7.18 to 86.47, thereby covering practically the entire
+length of the pitch.
+
+```{r code-distributions}
+d %>% select(all_of(num)) %>% pivot_longer(everything()) %>%
+  ggplot(aes(value)) + geom_histogram(bins = 40) +
+  facet_wrap(~ name, scales = "free", ncol = 5) +
+  labs(title = "Distribution of the player-level features")
+ggsave("figures/B2_raspodele.png", width = 15, height = 12, dpi = 130)
+```
+
+```{r b2, eval=TRUE, echo=FALSE, fig.cap="Figure 5: Histograms of all player-level features"}
+knitr::include_graphics("figures/B2_raspodele.png")
+```
+
+Positive skewness is most pronounced for `goals_p90` (2.29), `xg_p90` (1.96) and
+`assists_p90` (1.87); for goals the mean is 0.113 and the median 0.054, which
+reflects the genuine nature of the phenomenon. The negative skewness of `sd_x`
+(−1.58) and `mean_x` (−1.08) is a consequence of the presence of goalkeepers.
+
+No feature transformation was carried out: the decision tree and the random
+forest are insensitive to monotone transformations, while for the k-nearest
+neighbours method the influence of the tails is mitigated by standardisation
+inside the pipeline, within every cross-validation fold.
+
+## Relationships between features
+
+```{r code-correlations}
+cm <- cor(d[num])
+ggcorrplot::ggcorrplot(cm, hc.order = TRUE, type = "lower", tl.cex = 7) +
+  labs(title = "Correlations between features")
+ggsave("figures/B3_pirsonov_koeficijent_korelacije.png", width = 11, height = 10, dpi = 150)
+
+# pairs with an absolute correlation above 0.8
+cp <- as.data.frame(as.table(cm))
+cp <- cp[cp$Var1 != cp$Var2 & abs(cp$Freq) > 0.8, ]
+cp <- cp[!duplicated(t(apply(cp[, 1:2], 1, sort))), ]
+cp[order(-abs(cp$Freq)), ]
+```
+
+Pearson correlation coefficients were computed for all 465 feature pairs, of
+which 16 have an absolute value above 0.8. The strongest relationships are
+`d3_share`–`mean_x` (−0.980), `passes_completed_p90`–`passes_p90` (0.975) and
+`dribbles_completed_p90`–`dribbles_p90` (0.956).
+
+```{r b3, eval=TRUE, echo=FALSE, fig.cap="Figure 6: Pearson correlation coefficients"}
+knitr::include_graphics("figures/B3_pirsonov_koeficijent_korelacije.png")
+```
+
+The features `passes_completed_p90` and `dribbles_completed_p90` were removed
+from the modelling set; they are the product of the corresponding counter and
+the success percentage, so in distance-based methods they cause the same
+quantity to be counted more than once. **The final set contains 29 features.**
+The pair `d3_share`–`mean_x` was kept in full, since neither is derived from the
+other and both are near the top in discriminative power; their redundancy is
+covered by the scenario with dimensionality reduction.
+
+To assess discriminative power, a one-way analysis of variance was applied with
+the positional class as the factor:
+
+```{r code-anova}
+fvals <- sapply(num, function(v) summary(aov(d[[v]] ~ d$position_group))[[1]][1, 4])
+head(sort(fvals, decreasing = TRUE), 12)
+
+top8 <- names(head(sort(fvals, decreasing = TRUE), 8))
+d %>% select(position_group, all_of(top8)) %>%
+  pivot_longer(-position_group) %>%
+  ggplot(aes(position_group, value, fill = position_group)) +
+  geom_boxplot(outlier.size = 0.4) + facet_wrap(~ name, scales = "free_y") +
+  theme(legend.position = "none") +
+  labs(title = "The features that best separate the positional classes", x = NULL)
+ggsave("figures/B5_boxplot.png", width = 12, height = 8, dpi = 150)
+```
+
+| Feature | F | Feature | F |
+|---|---|---|---|
+| `d3_share` | 8,586.5 | `clearances_p90` | 1,523.1 |
+| `mean_x` | 6,953.7 | `miscontrols_p90` | 1,069.5 |
+| `avg_pass_length` | 3,036.9 | `pressures_p90` | 719.6 |
+| `sd_x` | 2,601.0 | `shots_p90` | 695.4 |
+| `f3_share` | 2,451.9 | `long_passes_p90` | 691.0 |
+
+*Table 3: The features that best separate the positions (ANOVA F)*
+
+Four of the five most discriminative features are spatial in nature. The
+strongest spatial feature, `d3_share`, has 5.6 times the discriminative power of
+the strongest event counter, `clearances_p90`. A player's position is therefore
+read more reliably from **where** the player moves than from **which** actions
+they perform. The spatial features were not part of the initial version of the
+table and were introduced only when the processing was moved to Spark.
+
+```{r b5, eval=TRUE, echo=FALSE, fig.cap="Figure 7: Box plots of the most discriminative features by class"}
+knitr::include_graphics("figures/B5_boxplot.png")
+```
+
+## Principal component analysis
+
+```{r code-pca}
+pca <- prcomp(d[num], scale. = TRUE)
+ve <- round(100 * summary(pca)$importance[2, 1:5], 1); ve
+which(cumsum(summary(pca)$importance[2, ]) >= 0.9)[1]   # number of components for 90%
+
+ggplot(data.frame(PC1 = pca$x[, 1], PC2 = pca$x[, 2], poz = d$position_group),
+       aes(PC1, PC2, color = poz)) +
+  geom_point(alpha = 0.6, size = 1.6) +
+  labs(title = sprintf("PCA — PC1 %.1f%%, PC2 %.1f%%", ve[1], ve[2]))
+ggsave("figures/B6_pca.png", width = 8, height = 6, dpi = 150)
+```
+
+Over the standardised dataset the first principal component explains 37.6% of
+the variance, the second 18.7% and the third 10.3%. Capturing 90% of the
+variance requires 11 components, which numerically confirms the redundancy
+observed earlier; that value was adopted as the parameter for the scenario with
+dimensionality reduction. The first two components carry 56.3%, enough for a
+two-dimensional display that is later used to show the clusters as well.
+
+```{r b6, eval=TRUE, echo=FALSE, fig.cap="Figure 8: Principal component analysis"}
+knitr::include_graphics("figures/B6_pca.png")
+```
+
+Goalkeepers stand out as a completely separate group, without a single overlap.
+The remaining five classes form a **continuum** along the first component,
+ordered from centre-backs through full-backs and midfielders to wingers and
+forwards, with no sharp boundaries between neighbouring classes. The finding
+indicates that positional roles are not discrete categories but points on a
+spectrum, so classification errors are expected to be concentrated between
+neighbouring classes.
+
+# Preparing the modelling dataset
+
+The preparation is performed once, and its results are used unchanged by all
+three classification methods, which makes the results comparable.
+
+```{r code-featcols}
+num <- setdiff(names(d)[sapply(d, is.numeric)],
+               c("player_id", "pos_purity", "purity6", "minutes"))
+feat_cols <- setdiff(num, c("passes_completed_p90", "dribbles_completed_p90"))
+saveRDS(feat_cols, "results/feat_cols.rds")   # 29 features
+```
+
+The data was transferred into Spark with the `copy_to` function and split in an
+80 : 20 ratio. The test set is not used during model and parameter selection;
+its only purpose is to evaluate the finally chosen solutions.
+
+The `sdf_random_split` function does not guarantee stratification by class. With
+an imbalanced dataset in which the smallest class has 125 rows, a random split
+may deviate substantially from the desired ratio and make the per-class
+estimates unstable. The split was therefore carried out with a window function:
+every row was assigned a random value with a fixed seed, within each class the
+percentile rank was computed with the `percent_rank` function, and the cut-off
+was set at 0.8.
+
+```{r code-split}
+tbl <- copy_to(sc, d[, c("player", "team", "position_group", feat_cols)],
+               "players", overwrite = TRUE)
+
+strat <- tbl %>%
+  group_by(position_group) %>%
+  mutate(rk = percent_rank(rand(42L))) %>%
+  ungroup()
+
+train <- strat %>% filter(rk <= 0.8) %>% select(-rk) %>% compute("train")
+test  <- strat %>% filter(rk >  0.8) %>% select(-rk) %>% compute("test")
+
+spark_write_parquet(train, sp("data/interim/train"), mode = "overwrite")
+spark_write_parquet(test,  sp("data/interim/test"),  mode = "overwrite")
+```
+
+| Class | Total | Train | Test | Share in training |
+|---|---|---|---|---|
+| GK | 125 | 100 | 25 | 80.0% |
+| CB | 300 | 240 | 60 | 80.0% |
+| FB | 332 | 265 | 67 | 79.8% |
+| DM_CM | 368 | 294 | 74 | 79.9% |
+| AM_W | 360 | 288 | 72 | 80.0% |
+| FW | 217 | 173 | 44 | 79.7% |
+| **Total** | **1,702** | **1,360** | **342** | **79.9%** |
+
+*Table 4: The achieved split by positional class*
+
+The share of the training part is between 79.7% and 80.0% in every class,
+including the smallest one, so stratification was fully achieved. Both tables
+were saved in Parquet format, so the k-nearest-neighbours method, which runs in
+R, uses an identical split. The random seed was fixed at 42 for full
+reproducibility.
+
+# Classification
+
+## Common setup
+
+Three classification models were built for the same target feature: a
+**decision tree**, a **random forest** and the **k-nearest-neighbours method**.
+All three use the same 29 features and an identical split, so differences in the
+results stem exclusively from the methods themselves.
+
+The tree and the forest were implemented through an `ml_pipeline` with four
+stages:
+
+```{r code-pipeline}
+base_pipeline <- ml_pipeline(sc) %>%
+  ft_string_indexer("position_group", "label") %>%                    # text -> numeric label
+  ft_vector_assembler(input_cols = feat_cols, output_col = "features_raw") %>%
+  ft_standard_scaler("features_raw", "features",
+                     with_mean = TRUE, with_std = TRUE)
+
+evaluator <- ml_multiclass_classification_evaluator(
+  sc, label_col = "label", prediction_col = "prediction", metric_name = "f1")
+
+run_cv <- function(grid, pipe) {
+  cv <- ml_cross_validator(sc, estimator = pipe, estimator_param_maps = grid,
+                           evaluator = evaluator, num_folds = 10,
+                           parallelism = 4, seed = 42)
+  ml_fit(cv, train)
+}
+```
+
+Placing the standardisation **inside** the pipeline has a methodological
+consequence. Since the whole pipeline is passed to the cross-validation object
+as a single unit, the standardisation parameters are refitted in each of the ten
+folds, and exclusively over the training data of that fold. This rules out the
+information leakage that would occur if standardisation had been carried out
+over the entire training set before the split into folds.
+
+Standardisation is not necessary for the tree and the forest, since branching
+decisions are made by comparison against thresholds. It was kept so that all
+three methods use identical preparation.
+
+The **weighted F1 measure** was used as the performance measure, chosen instead
+of plain accuracy because of class imbalance, where the ratio of the most
+numerous to the least numerous class is 2.9 : 1. Cross-validation was carried
+out with ten folds, with `parallelism = 4` — the folds are mutually independent,
+so the job is almost ideally parallel.
+
+The Spark MLlib library **has no k-nearest-neighbours classifier** — it only
+offers an LSH-based approximation of the neighbourhood, without a classification
+head. That method was therefore implemented in R, with the `kknn` package.
+
+## Decision tree
+
+```{r code-dt-grids}
+pipe_dt <- base_pipeline %>%
+  ml_decision_tree_classifier(features_col = "features", label_col = "label")
+
+g1 <- list(decision_tree = list(max_depth = c(2, 3, 5, 8, 12, 20)))
+g2 <- list(decision_tree = list(min_instances_per_node = c(1, 5, 10, 20, 50),
+                                min_info_gain = c(0, 0.001, 0.01)))
+g3 <- list(decision_tree = list(impurity = c("gini", "entropy"),
+                                max_depth = c(5, 10, 15)))
+
+t1 <- system.time(cv1 <- run_cv(g1, pipe_dt))
+t2 <- system.time(cv2 <- run_cv(g2, pipe_dt))
+t3 <- system.time(cv3 <- run_cv(g3, pipe_dt))
+
+vm1 <- ml_validation_metrics(cv1) %>% arrange(desc(f1))
+vm2 <- ml_validation_metrics(cv2) %>% arrange(desc(f1))
+vm3 <- ml_validation_metrics(cv3) %>% arrange(desc(f1))
+```
+
+The column names returned by `ml_validation_metrics` carry the suffix of the
+pipeline stage (`max_depth_1`), so they cannot be hard-coded in the plotting
+code. A helper function finds the name by pattern:
+
+```{r code-pick}
+pick <- function(vm, pat) names(vm)[grepl(pat, names(vm), ignore.case = TRUE)][1]
+
+ggplot(vm1, aes(.data[[pick(vm1, "max_depth")]], f1)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 2.5) +
+  labs(title = "Decision tree, scenario 1: tree depth",
+       subtitle = "F1 measure, 10-fold cross-validation",
+       x = "Maximum depth", y = "F1")
+ggsave("figures/DT_S1.png", width = 7, height = 4.5, dpi = 150)
+```
+
+### Scenario 1 — tree depth
+
+```{r dt-s1, eval=TRUE, echo=FALSE}
+tab(dt_s1, "Table 5 — Decision tree, scenario 1: maximum depth")
+```
+
+```{r dt-s1-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 9: Decision tree, effect of the maximum depth"}
+knitr::include_graphics("figures/DT_S1.png")
+```
+
+The curve shows a clearly pronounced bias–variance trade-off. At depth 2 the
+tree has at most four leaves, which is not enough to distinguish six classes, so
+the F1 measure drops to 0.5299. Moving to depth 3 makes performance rise
+sharply; it reaches its maximum at depth 5 and afterwards declines slightly but
+steadily, which indicates overfitting. In the range from depth 3 to 20 the
+difference between the best and the lowest value is only 2.3 percentage points,
+from which it follows that the choice of depth, provided it is not trivially
+small, is not decisive.
+
+### Scenario 2 — branching stopping conditions
+
+```{r dt-s2, eval=TRUE, echo=FALSE}
+tab(dt_s2, "Table 6 — Decision tree, scenario 2: stopping conditions")
+```
+
+```{r dt-s2-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 10: Decision tree, branching stopping conditions"}
+knitr::include_graphics("figures/DT_S2.png")
+```
+
+The `min_info_gain` parameter has practically no effect on the result: the
+values 0 and 0.001 give identical results in all cases, while 0.01 makes a
+difference only at the smallest values of the other parameter. The splits the
+tree chooses are already informative enough, so the information-gain threshold
+rarely becomes an active constraint. In the figure the curve for the value 0 is
+not visible because it is completely covered by the other two — this is not a
+shortcoming of the display but a consequence of the results being identical.
+
+Increasing the minimum number of instances in a node reduces the F1 measure
+overall, from 0.8852 at the value 1 to 0.8707 at the value 50, although the
+decline is not strictly monotone. The total range across all 15 combinations is
+1.5 percentage points.
+
+### Scenario 3 — branching criterion
+
+```{r dt-s3, eval=TRUE, echo=FALSE}
+tab(dt_s3, "Table 7 — Decision tree, scenario 3: impurity criterion")
+```
+
+```{r dt-s3-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 11: Decision tree, Gini index versus entropy"}
+knitr::include_graphics("figures/DT_S3.png")
+```
+
+Entropy gives a better result at every depth examined, and its advantage grows
+with depth: 0.13 percentage points at depth 5, then 0.86 at depth 10 and 1.78 at
+depth 15. The explanation is that entropy penalises node impurity more strongly
+than the Gini index, so at greater depths, when nodes cover a smaller number of
+examples, it makes more cautious branching decisions and overfits more slowly.
+At smaller depths the difference is negligible, which is consistent with the
+generally accepted finding that the choice of impurity criterion rarely has a
+material effect on the performance of a tree.
+
+### Choice of solution and evaluation on the test set
+
+The best scenario is chosen by the highest mean F1 measure from
+cross-validation, and `best_model` has already been refitted over the entire
+training set:
+
+```{r code-dt-choice}
+best_f1   <- c(S1 = max(vm1$f1), S2 = max(vm2$f1), S3 = max(vm3$f1))
+best_scen <- names(which.max(best_f1))
+best_cv   <- list(S1 = cv1, S2 = cv2, S3 = cv3)[[best_scen]]
+best_model <- best_cv$best_model
+```
+
+The model predicts numeric labels, so before the confusion matrix the
+index → class-name dictionary must be reconstructed:
+
+```{r code-dt-test}
+map_lab <- ml_transform(best_model, train) %>%
+  select(position_group, label) %>% distinct() %>% collect()
+
+preds <- ml_transform(best_model, test) %>%
+  select(position_group, label, prediction) %>% collect() %>%
+  left_join(map_lab, by = c("prediction" = "label"), suffix = c("", "_pred")) %>%
+  rename(pred_group = position_group_pred)
+
+lvl <- c("GK","CB","FB","DM_CM","AM_W","FW")   # order from defence to attack
+cm <- caret::confusionMatrix(factor(preds$pred_group,     levels = lvl),
+                             factor(preds$position_group, levels = lvl))
+```
+
+The order of the levels is not alphabetical but runs from defence to attack, so
+that the structure of the errors in the matrix is visible.
+
+Comparing the best results per scenario — 0.8844 for the first, 0.8852 for the
+second and 0.8857 for the third — the model from the third scenario was chosen,
+with the entropy criterion and a maximum depth of 5. The best results of all
+three scenarios differ by less than 0.15 percentage points, from which it
+follows that the method has reached its ceiling on the available data.
+
+| Indicator | Value |
+|---|---|
+| F1 from cross-validation (10 folds) | 0.8857 |
+| Accuracy on the test set | 0.9123 |
+| 95% confidence interval | (0.877 – 0.940) |
+| Cohen's kappa | 0.8926 |
+| Macro precision | 0.9276 |
+| Macro recall | 0.9191 |
+| Macro F1 | 0.9226 |
+| Balanced accuracy | 0.9504 |
+| Multiclass AUC (Hand–Till) | 0.9776 |
+| Training time for a single model | 2.6 s |
+| Prediction time over the test set | 0.5 s |
+| Number of models trained in the search | 273 |
+
+*Table 8: Performance indicators of the selected decision tree*
+
+An accuracy of 91.2% substantially exceeds the majority-class rate of 21.6%,
+with p < 0.001. Cohen's kappa of 0.8926 shows almost perfect agreement with the
+true labels.
+
+The multiclass AUC is the only indicator that is not derived from the confusion
+matrix. The remaining measures evaluate the model's final decision, while the
+AUC is computed from the distribution of per-class probabilities and measures
+how reliably the model separates the classes before making a decision. The
+probabilities are obtained by decomposing the vector column `probability`:
+
+```{r code-auc}
+probs <- ml_transform(best_model, test) %>%
+  sdf_separate_column("probability", into = paste0("p", 0:5)) %>%
+  select(label, p0, p1, p2, p3, p4, p5) %>% collect()
+
+pmat <- as.matrix(probs[, paste0("p", 0:5)])
+colnames(pmat) <- as.character(0:5)
+
+auc <- pROC::multiclass.roc(response = factor(probs$label, levels = 0:5),
+                            predictor = pmat)
+```
+
+The macro F1 on the test set (0.9226) is higher than the value from
+cross-validation (0.8857). The difference has two sources: cross-validation
+trains each model over nine tenths of the training set, so it gives a slightly
+pessimistic estimate, and the measures applied are not identical — Spark
+computes an F1 weighted by the number of examples per class, whereas macro F1 is
+a plain arithmetic mean over the classes, which the goalkeeper class, with its
+perfect result, pushes upwards.
+
+```{r dt-by-class, eval=TRUE, echo=FALSE}
+tab(dt_by_class, "Table 9 — Decision tree: performance by positional class")
+```
+
+The goalkeeper class was classified perfectly on every indicator. That result is
+not a genuine achievement of the model: goalkeepers have feature values that do
+not overlap with any other class, which is also visible in the principal
+component plot. The class is therefore treated as trivial in the interpretation,
+with the note that it raises the values of the macro measures.
+
+The hardest class is that of attacking midfielders and wingers, with an F1
+measure of 0.8630. That class makes errors in both directions towards both
+neighbouring classes. The class of defensive and central midfielders has the
+lowest precision alongside a high recall, from which it follows that the model
+has a tendency to place borderline cases into it.
+
+```{r dt-confusion, eval=TRUE, echo=FALSE, fig.cap="Figure 12: Confusion matrix — decision tree"}
+knitr::include_graphics("figures/DT_confusion.png")
+```
+
+Of 342 examples, 312 were classified correctly and 30 incorrectly. All the
+populated cells lie on the diagonal or in its immediate vicinity, while the
+corners of the matrix are empty. **Twenty-nine of the 30 errors occur between
+classes that are neighbours on the defence–attack spectrum.** The only exception
+is a full-back placed among the wingers; even that case is not arbitrary, since
+full-backs and wingers share a movement pattern along the touchlines.
+
+The project specification assumed that the most frequent errors would be between
+related positions, with full-backs and centre-backs given as an example. The
+hypothesis was confirmed in its general form, but the stated example was not:
+the centre-back–full-back pair has just one error and is among the best
+separated. The dominant confusions occur in the attacking part of the spectrum.
+
+The structure of the selected tree and the feature importances are read directly
+from the Scala object through the JVM bridge, since sparklyr does not expose all
+MLlib methods:
+
+```{r code-dt-structure}
+dt_stage <- ml_stage(best_model, 4)          # the 4th pipeline stage is the classifier
+imp <- spark_jobj(dt_stage) %>% invoke("featureImportances") %>% invoke("toArray")
+
+imp_df <- data.frame(obelezje = feat_cols, znacaj = round(imp, 4)) %>%
+  arrange(desc(znacaj))
+
+cat("Depth:", invoke(spark_jobj(dt_stage), "depth"),
+    "| Number of nodes:", invoke(spark_jobj(dt_stage), "numNodes"), "\n")
+
+writeLines(invoke(spark_jobj(dt_stage), "toDebugString"),
+           "results/dt_tree_structure.txt")   # the whole tree as a set of rules
+```
+
+```{r dt-importance, eval=TRUE, echo=FALSE, fig.cap="Figure 13: Feature importance — decision tree"}
+knitr::include_graphics("figures/DT_importance.png")
+```
+
+The selected tree has a depth of 5 and 33 nodes in total, of which 16 are
+internal splits and 17 are leaves. The first four features carry 89.6% of the
+total importance, with `mean_x` alone carrying 60.3% — more than all the
+remaining 28 features together.
+
+A comparison with the analysis of variance reveals two phenomena. First,
+**correlated features suppress one another**: `d3_share` was the most
+discriminative feature on its own, but it correlates −0.980 with `mean_x`, which
+the tree chooses for its first split and thereby exhausts that information.
+Second, **the tree rewards complementary information**: `interceptions_p90` was
+not among the top twelve by the analysis of variance, but it is third by
+importance in the tree, because it distinguishes a defensive midfielder from a
+full-back, who move at a similar distance from their own goal.
+
+## Random forest
+
+An identical pipeline was used, with a change only in the fourth stage. The
+random forest contains two sources of randomness — the sampling of instances
+when building each tree and the choice of a subset of features at every split —
+so the seed was fixed at 42.
+
+```{r code-rf-grids}
+pipe_rf <- base_pipeline %>%
+  ml_random_forest_classifier(features_col = "features", label_col = "label",
+                              seed = 42)
+
+# S1: ensemble size
+g1 <- list(random_forest = list(num_trees = c(20, 50, 100, 250, 500)))
+# S2: complexity of an individual tree x strength of decorrelation (sampling COLUMNS)
+g2 <- list(random_forest = list(max_depth = c(3, 5, 10, 15),
+                                feature_subset_strategy = c("sqrt","log2","onethird")))
+# S3: aggressiveness of ROW sampling x pre-pruning
+g3 <- list(random_forest = list(subsampling_rate = c(0.6, 0.8, 1.0),
+                                min_instances_per_node = c(1, 5, 20)))
+
+t1 <- system.time(cv1 <- run_cv(g1, pipe_rf))
+t2 <- system.time(cv2 <- run_cv(g2, pipe_rf))
+t3 <- system.time(cv3 <- run_cv(g3, pipe_rf))
+```
+
+### Scenario 1 — number of trees in the ensemble
+
+```{r rf-s1, eval=TRUE, echo=FALSE}
+tab(rf_s1, "Table 10 — Random forest, scenario 1: number of trees")
+```
+
+```{r rf-s1-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 14: Random forest, effect of the number of trees"}
+knitr::include_graphics("figures/RF_S1.png")
+```
+
+The largest gain is realised by moving from 20 to 50 trees, where F1 rises by
+0.71 percentage points. After that the curve flattens out: a tenfold increase of
+the ensemble, from 50 to 500 trees, brings only a further 0.29 percentage
+points. The ensemble reduces variance by averaging, with the reduction
+proportional to the reciprocal of the number of trees, so the gain falls off
+quickly. Unlike depth, increasing the number of trees **does not lead to
+overfitting**, which is visible from the absence of a decline in the right-hand
+part of the curve.
+
+### Scenario 2 — tree depth and feature subset
+
+The `feature_subset_strategy` parameter determines how many features are
+considered at random at **every split**: `sqrt` gives ⌈√29⌉ = 6 features, `log2`
+⌈log₂29⌉ = 5, and `onethird` ⌈29/3⌉ = 10. This is column sampling, as opposed to
+`subsampling_rate` in the next scenario, which samples rows.
+
+```{r rf-s2, eval=TRUE, echo=FALSE}
+tab(rf_s2, "Table 11 — Random forest, scenario 2: depth and feature subset")
+```
+
+```{r rf-s2-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 15: Random forest, depth and feature selection strategy"}
+knitr::include_graphics("figures/RF_S2.png")
+```
+
+Three regularities stand out. Shallow trees of depth 3 give the worst results
+under every strategy, because an individual tree with at most eight leaves
+cannot distinguish six classes, so not even averaging removes that limitation.
+The `log2` strategy gives the worst results at every depth except the smallest —
+with one feature fewer per split it introduces more randomness than is useful.
+Finally, `sqrt` peaks at depth 10 and then declines, while `onethird` flattens
+out at depths 10 and 15: a smaller subset introduces more diversity, so at large
+depths the individual trees overfit more.
+
+### Scenario 3 — subsampling rate and minimum node size
+
+```{r rf-s3, eval=TRUE, echo=FALSE}
+tab(rf_s3, "Table 12 — Random forest, scenario 3: sampling and node size")
+```
+
+```{r rf-s3-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 16: Random forest, subsampling rate and minimum node size"}
+knitr::include_graphics("figures/RF_S3.png")
+```
+
+The influence of both parameters is weak — the total range across all nine
+combinations is 1.26 percentage points. A `min_instances_per_node` of 20 gives
+the worst results at every subsampling rate, because it stops branching too
+early and thereby reduces the diversity among the trees, which is the basic
+source of the ensemble's advantage. At the smallest value of the minimum node
+size a peak appears at a rate of 0.8, while at larger values F1 rises
+monotonically up to 1.0: when the trees are unconstrained in node size, partial
+sampling introduces the necessary diversity, whereas with already constrained
+trees it only reduces the amount of data.
+
+### Choice of solution and evaluation on the test set
+
+The parameters of the selected model are not transcribed by hand but read from
+the model itself and passed to the final training:
+
+```{r code-rf-parameters}
+rf_stage <- ml_stage(best_model, 4)
+cat("num_trees:",   invoke(spark_jobj(rf_stage), "getNumTrees"), "\n")
+cat("max_depth:",   invoke(spark_jobj(rf_stage), "getMaxDepth"), "\n")
+cat("subset:",      invoke(spark_jobj(rf_stage), "getFeatureSubsetStrategy"), "\n")
+cat("total nodes:", invoke(spark_jobj(rf_stage), "totalNumNodes"), "\n")
+
+pipe_best <- base_pipeline %>%
+  ml_random_forest_classifier(
+    features_col = "features", label_col = "label", seed = 42,
+    num_trees               = invoke(spark_jobj(rf_stage), "getNumTrees"),
+    max_depth               = invoke(spark_jobj(rf_stage), "getMaxDepth"),
+    feature_subset_strategy = invoke(spark_jobj(rf_stage), "getFeatureSubsetStrategy"),
+    subsampling_rate        = invoke(spark_jobj(rf_stage), "getSubsamplingRate"),
+    min_instances_per_node  = invoke(spark_jobj(rf_stage), "getMinInstancesPerNode"))
+
+t_fit  <- system.time(final_model <- ml_fit(pipe_best, train))
+t_pred <- system.time(ml_transform(final_model, test) %>% sdf_nrow())  # sdf_nrow forces execution
+```
+
+The model from the first scenario was chosen: 500 trees, maximum depth 5,
+strategy `auto` (which for classification corresponds to the value `sqrt`), a
+full subsampling rate and a minimum node size of 1. The ensemble contains 21,544
+nodes in total.
+
+The difference between the first and the second scenario is only 0.08 percentage
+points, so the results can be considered practically equal. A **limitation of
+the search performed** should also be noted: in the first scenario only the
+number of trees was varied, with the depth left at its default value of 5, while
+the second scenario showed that a depth of 10 is more favourable. The
+combination of a large number of trees and a greater depth was not examined,
+since the scenarios were, in line with the requirement, defined as separate
+units. It is possible that such a combination would give a somewhat better
+result.
+
+| Indicator | Value |
+|---|---|
+| F1 from cross-validation (10 folds) | 0.9244 |
+| Accuracy on the test set | 0.9415 |
+| 95% confidence interval | (0.911 – 0.964) |
+| Cohen's kappa | 0.9284 |
+| Macro precision | 0.9513 |
+| Macro recall | 0.9448 |
+| Macro F1 | 0.9476 |
+| Balanced accuracy | 0.9663 |
+| Multiclass AUC (Hand–Till) | 0.9966 |
+| Training time for a single model | 6.21 s |
+| Prediction time over the test set | 0.42 s |
+| Total number of nodes in the ensemble | 21,544 |
+| Number of models trained in the search | 263 |
+
+*Table 13: Performance indicators of the selected random forest*
+
+The random forest outperforms the decision tree on every indicator. Accuracy is
+higher by 2.9 percentage points, macro F1 by 2.5 and kappa by 3.6. The number of
+misclassified examples was reduced from 30 to 20, i.e. by a third.
+
+The difference in the AUC indicator is particularly pronounced, rising from
+0.9776 to 0.9966. Since that indicator is computed from the distribution of
+probabilities, its increase shows that the ensemble not only makes more accurate
+decisions but also makes them with a better-calibrated degree of confidence —
+the probabilities arise from averaging the predictions of 500 trees, so they are
+graded far more finely than the probabilities of a single tree, which are
+limited by the composition of the leaves.
+
+The price of that improvement is 2.4 times longer training and a 653 times more
+complex model, from 33 to 21,544 nodes.
+
+```{r rf-by-class, eval=TRUE, echo=FALSE}
+tab(rf_by_class, "Table 14 — Random forest: performance by positional class")
+```
+
+The ordering of the classes by difficulty is unchanged relative to the tree, but
+an improvement was achieved in every class without exception. The largest single
+advance was achieved in the precision of the central midfielder class, which
+rises from 0.8415 to 0.9103: with the tree that class served as a dumping ground
+for borderline cases, and with the ensemble the phenomenon is considerably
+mitigated.
+
+```{r rf-confusion, eval=TRUE, echo=FALSE, fig.cap="Figure 17: Confusion matrix — random forest"}
+knitr::include_graphics("figures/RF_confusion.png")
+```
+
+The structure of the errors is identical to that of the tree. Nineteen of the 20
+errors occur between neighbouring classes, and the only exception is again a
+full-back placed among the wingers. **The ensemble did not change the nature of
+the errors, only their number.**
+
+The feature importance rankings of the two methods are merged for direct
+comparison:
+
+```{r code-rf-imp-comparison}
+imp <- spark_jobj(rf_stage) %>% invoke("featureImportances") %>% invoke("toArray")
+imp_df <- data.frame(obelezje = feat_cols, znacaj = round(imp, 4)) %>%
+  arrange(desc(znacaj))
+
+if (file.exists("results/dt_importance.csv")) {
+  dt_imp <- read.csv("results/dt_importance.csv")
+  poredjenje <- merge(imp_df, dt_imp, by = "obelezje",
+                      suffixes = c("_suma", "_stablo")) %>%
+    arrange(desc(znacaj_suma))
+  write.csv(poredjenje, "results/importance_poredjenje.csv", row.names = FALSE)
+}
+```
+
+```{r rf-importance, eval=TRUE, echo=FALSE, fig.cap="Figure 18: Feature importance — random forest"}
+knitr::include_graphics("figures/RF_importance.png")
+```
+
+| Feature | Random forest | Decision tree |
+|---|---|---|
+| `d3_share` | 0.1371 | 0.0702 |
+| `mean_x` | 0.1315 | **0.6028** |
+| `f3_share` | 0.1232 | 0.0065 |
+| `sd_x` | 0.0973 | 0.1218 |
+| `clearances_p90` | 0.0802 | **0.0000** |
+| `sd_y` | 0.0547 | **0.0000** |
+| `tackles_p90` | 0.0347 | **0.0000** |
+| `shots_p90` | 0.0336 | 0.0223 |
+| `pressures_p90` | 0.0328 | 0.0146 |
+| `miscontrols_p90` | 0.0324 | **0.0000** |
+| `interceptions_p90` | 0.0321 | 0.1012 |
+| `carries_p90` | 0.0226 | 0.0278 |
+
+*Table 15: Feature importance — random forest versus decision tree*
+
+The comparison reveals a fundamental difference in the way the two methods use
+the features. In the tree the importance is markedly concentrated: `mean_x`
+carries 60.3%, and the first four features 89.6%. In the forest the distribution
+is considerably more even: the most important feature carries 13.7%, and the
+first four 48.9%.
+
+The cause lies in the random selection of a subset of features. The feature
+`mean_x` is not available at most splits, so the tree has to fall back on
+related features. The consequence is most noticeable for four features —
+`clearances_p90`, `sd_y`, `tackles_p90` and `miscontrols_p90` — which the
+selected tree did not use even once, while in the ensemble they carry 20.2% of
+the importance between them.
+
+The importance ordering in the forest is considerably closer to the results of
+the analysis of variance than the ordering from the tree, which is to be
+expected: the analysis of variance measures the individual discriminative power
+of each feature independently of the others, and it is precisely such a measure
+that the ensemble approximates better. The practical conclusion is that feature
+importance in a single tree should be interpreted with caution in the presence
+of correlated features.
+
+## The k-nearest-neighbours method
+
+Spark is used here only to load the identical split, after which the connection
+is closed — the 1360 × 29 training matrix fits entirely in memory, so keeping
+the executors alive during the long R phase would be spending 8 GB with no
+benefit.
+
+So that the numbers remain comparable with the Spark pipelines, the weighted F1
+measure was implemented with a definition **identical** to the one in
+`MulticlassClassificationEvaluator(metric_name = "f1")`:
+
+```{r code-knn-f1}
+f1_weighted <- function(actual, predicted, levels_ = lvl) {
+  tab  <- table(factor(predicted, levels = levels_),
+                factor(actual,    levels = levels_))   # rows: predictions
+  tp   <- diag(tab)
+  prec <- tp / rowSums(tab)          # denominator: how many times the class was predicted
+  rec  <- tp / colSums(tab)          # denominator: how many times the class occurs
+  f1   <- 2 * prec * rec / (prec + rec)
+  f1[!is.finite(f1)] <- 0            # a class that is neither predicted nor present
+  w    <- colSums(tab) / sum(tab)    # weights by the frequency of the true class
+  sum(w * f1)
+}
+```
+
+Standardisation is, as in the pipeline, learned **exclusively on the training
+part of each fold**; the built-in scaling in `kknn` is switched off because it
+would do it over the whole dataset:
+
+```{r code-knn-scale}
+scale_pair <- function(A, B) {
+  m <- colMeans(A); s <- apply(A, 2, stats::sd)
+  s[s == 0 | is.na(s)] <- 1
+  list(A = scale(A, center = m, scale = s),
+       B = scale(B, center = m, scale = s))
+}
+
+knn_predict <- function(Xa, ya, Xb, yb, k, distance, kernel) {
+  dtr <- data.frame(Xa, y = ya, check.names = FALSE)
+  dte <- data.frame(Xb, y = yb, check.names = FALSE)
+  kknn::kknn(y ~ ., train = dtr, test = dte,
+             k = k, distance = distance, kernel = kernel,
+             scale = FALSE)          # we have already done the scaling ourselves
+}
+```
+
+The cross-validation was written by hand, with **stratified** folds, so the
+results of all ten folds were kept and the standard deviation, which
+`ml_validation_metrics` does not return, is therefore available:
+
+```{r code-knn-cv}
+set.seed(42)
+folds <- caret::createFolds(ytr, k = 10, list = TRUE, returnTrain = FALSE)
+
+cv_knn <- function(k, distance = 2, kernel = "rectangular") {
+  vapply(folds, function(idx) {
+    s   <- scale_pair(Xtr[-idx, , drop = FALSE], Xtr[idx, , drop = FALSE])
+    fit <- knn_predict(s$A, ytr[-idx], s$B, ytr[idx], k, distance, kernel)
+    f1_weighted(ytr[idx], fit$fitted.values)
+  }, numeric(1))
+}
+
+run_grid <- function(grid) {
+  bind_rows(lapply(seq_len(nrow(grid)), function(i) {
+    f1s <- cv_knn(grid$k[i], grid$distance[i], grid$kernel[i])
+    cbind(grid[i, , drop = FALSE],
+          f1    = round(mean(f1s), 4),
+          f1_sd = round(stats::sd(f1s), 4),
+          f1_se = round(stats::sd(f1s) / sqrt(length(f1s)), 4))
+  }))
+}
+
+g1 <- expand.grid(k = c(1,3,5,7,9,11,15,21,31,51),
+                  distance = 2, kernel = "rectangular", stringsAsFactors = FALSE)
+g2 <- expand.grid(k = c(5,9,15,21,31), distance = 2,
+                  kernel = c("rectangular","triangular","gaussian","inv"),
+                  stringsAsFactors = FALSE)
+g3 <- expand.grid(k = c(5,9,15,21,31), distance = c(1,2,3),
+                  kernel = "rectangular", stringsAsFactors = FALSE)
+```
+
+KNN is a lazy classifier: there is no training phase in the proper sense, the
+model is the training set itself, and all the computation is deferred to the
+moment of prediction.
+
+### Scenario 1 — number of neighbours
+
+```{r knn-s1, eval=TRUE, echo=FALSE}
+tab(knn_s1, "Table 16 — KNN, scenario 1: number of neighbours")
+```
+
+```{r knn-s1-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 19: KNN, effect of the number of neighbours (error bars are ±1 SE)"}
+knitr::include_graphics("figures/KNN_S1.png")
+```
+
+For k = 1 the model memorises individual instances and F1 drops to 0.8789 — that
+is the only configuration that stands out convincingly from the rest. From k = 5
+onwards the curve flattens and stays in the band 0.917–0.923 all the way to
+k = 51, where slight over-smoothing of the boundaries begins to reduce the
+result. It is also observed that the standard deviation across folds decreases
+monotonically as k grows (0.0321 for k = 5 versus 0.0160 for k = 21), which is a
+direct consequence of averaging over more neighbours.
+
+### Scenario 2 — weighting the neighbours' votes
+
+```{r knn-s2, eval=TRUE, echo=FALSE}
+tab(knn_s2, "Table 17 — KNN, scenario 2: kernel function")
+```
+
+```{r knn-s2-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 20: KNN, the way the neighbours' votes are weighted"}
+knitr::include_graphics("figures/KNN_S2.png")
+```
+
+The structure of the results is instructive: **weighting helps only at large k.**
+For k = 5 the triangular kernel is the worst in the whole scenario (0.9045),
+because with few neighbours an aggressive reduction of the weight of the most
+distant ones effectively reduces the decision to two or three votes and brings
+back an instability similar to the one at k = 1. At k = 31 the same kernel
+becomes the best (0.9261), because it damps the contribution of distant
+neighbours that no longer belong to the local neighbourhood.
+
+### Scenario 3 — distance metric
+
+```{r knn-s3, eval=TRUE, echo=FALSE}
+tab(knn_s3, "Table 18 — KNN, scenario 3: Minkowski parameter")
+```
+
+```{r knn-s3-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 21: KNN, effect of the distance metric"}
+knitr::include_graphics("figures/KNN_S3.png")
+```
+
+This is the scenario with the most pronounced influence. The Manhattan distance
+is the best at larger k (0.9292 for k = 21), while p = 3 is consistently the
+weakest at all five points. The explanation lies in the dimensionality of the
+space: with 29 standardised features, a larger p increasingly allows a single
+feature with a large deviation to dominate the distance, so the neighbourhood is
+determined on the basis of an exception rather than on the basis of the player's
+overall profile. The Manhattan metric sums the absolute deviations evenly and is
+therefore more robust.
+
+### Choice of solution and evaluation on the test set
+
+The chosen configuration is **k = 21, Manhattan distance (p = 1), unweighted
+voting**, with CV F1 = 0.9292 (SE = 0.0079).
+
+The choice should be interpreted with a caveat. The total range across all 45
+configurations examined is 0.8789–0.9292, and the typical standard error across
+folds is 0.0071. The difference between the best results of the three scenarios
+(0.9232, 0.9261, 0.9292) is smaller than one standard error, so it cannot be
+claimed that the chosen configuration is statistically significantly better than
+a dozen others. The only findings that rise above the noise are the weakness of
+k = 1 and the systematic advantage of the Manhattan metric over p = 3.
+
+| Indicator | Value |
+|---|---|
+| F1 from cross-validation (10 folds) | 0.9292 |
+| Accuracy on the test set | 0.9357 |
+| 95% confidence interval | (0.904 – 0.959) |
+| Cohen's kappa | 0.9214 |
+| Weighted F1 on the test set | 0.9359 |
+| Macro precision | 0.9398 |
+| Macro recall | 0.9447 |
+| Macro F1 | 0.9416 |
+| Balanced accuracy | 0.9658 |
+| Multiclass AUC (Hand–Till) | 0.9962 |
+| Preparation of the reference set | 0.11 s |
+| Prediction time over the test set | 0.32 s |
+| Number of models evaluated in the search | 451 |
+
+*Table 19: Performance indicators of the selected KNN model*
+
+```{r knn-by-class, eval=TRUE, echo=FALSE}
+tab(knn_by_class, "Table 20 — KNN: performance by positional class")
+```
+
+```{r knn-confusion, eval=TRUE, echo=FALSE, fig.cap="Figure 22: Confusion matrix — KNN"}
+knitr::include_graphics("figures/KNN_confusion.png")
+```
+
+Of the 22 errors in total, nine fall on the AM_W–FW pair. That is also the only
+pair with two-way confusion and it explains why FW has the lowest precision
+(0.857) and AM_W the lowest recall (0.889). The error is not technical but
+substantive: in modern formations a winger who frequently cuts inside into the
+penalty area and a wide forward have an almost identical profile of touches,
+runs and spatial distribution.
+
+An AUC of 0.9962 is high, but it should be read with care: with an unweighted
+kernel the probabilities are multiples of 1/21, so the resolution of the ranking
+is coarse and the measure is less informative than for methods that produce
+smooth probabilities.
+
+The cost profile is characteristic of lazy learning: "training" takes 0.11 s
+because it amounts to forming the reference table, while prediction takes three
+times longer even though it concerns a set that is four times smaller. For the
+tree and the forest the relation is reversed. The relation of the times per
+scenario is also interesting: S1, with only 10 combinations, takes 15.8 s, while
+S2, with 20 combinations, takes 6.7 s, because S1 contains k = 51 and the
+complexity of the neighbour search grows with k. **For KNN the number of
+combinations is not a good indicator of cost** — what matters is the value of k
+and the number of instances.
+
+KNN has no built-in importance measure, so **permutation importance** was
+applied: every feature is randomly shuffled in the test set and the drop in the
+weighted F1 measure is measured:
+
+```{r code-knn-imp}
+set.seed(42); REPS <- 5
+base_f1 <- f1_weighted(yte, final$fitted.values)
+
+drops <- vapply(seq_along(feat_cols), function(j) {
+  mean(replicate(REPS, {
+    Xp <- s_full$B
+    Xp[, j] <- sample(Xp[, j])            # shuffle only the j-th feature
+    fp <- knn_predict(s_full$A, ytr, Xp, yte,
+                      best_row$k, best_row$distance, best_row$kernel)
+    base_f1 - f1_weighted(yte, fp$fitted.values)
+  }))
+}, numeric(1))
+```
+
+```{r knn-importance, eval=TRUE, echo=FALSE, fig.cap="Figure 23: Feature importance — KNN (permutation)"}
+knitr::include_graphics("figures/KNN_importance.png")
+```
+
+Two spatial features dominate: `mean_y` carries 19% of the total drop, and
+`sd_x` a further 16%.
+
+Two caveats on the interpretation. First, this is not the same scale as the Gini
+importance for the tree and the forest, which by definition sums to 1 — the
+ordering is comparable, not the absolute value. Second, **permutation importance
+underestimates features that are correlated with one another**: if two features
+carry the same information, shuffling one does no harm because the other remains
+untouched, so both appear unimportant. That is precisely what explains why
+`mean_y` is in first place even though by the analysis of variance it is not
+even among the top five — it has no strong correlate in the dataset, so
+shuffling it cannot be compensated for.
+
+## Choice of solution across all methods
+
+### Selection criterion
+
+The choice was guided by the F1 measure from cross-validation, i.e. by the same
+criterion applied when selecting the parameters within each method. The test set
+was not used as a selection criterion but exclusively as independent
+confirmation. Where the values were approximately equal, supplementary criteria
+were applied — the structure of the errors, the cost of prediction, the
+behaviour as the data volume grows and the interpretability of the model.
+
+Since all three scripts write a row with **identical column names**, the
+comparison reduces to merging three files:
+
+```{r code-comparison}
+paths <- c(KNN = "results/knn_best.csv",
+           DT  = "results/dt_best.csv",
+           RF  = "results/rf_best.csv")
+existing <- paths[file.exists(paths)]
+
+svi <- bind_rows(lapply(existing, read.csv)) %>% arrange(desc(cv_f1))
+winner <- svi$metod[which.max(svi$cv_f1)]
+
+svi %>%
+  select(metod, cv_f1, test_tacnost, makro_f1, bal_tacnost) %>%
+  tidyr::pivot_longer(-metod, names_to = "pokazatelj", values_to = "vrednost") %>%
+  ggplot(aes(pokazatelj, vrednost, fill = metod)) +
+  geom_col(position = "dodge") +
+  coord_cartesian(ylim = c(0.8, 1.0)) +
+  labs(title = "Comparison of the classification methods",
+       subtitle = "CV F1 from the training set, everything else from the test set",
+       x = NULL, y = NULL, fill = "Method")
+ggsave("figures/POREDJENJE_metode.png", width = 8, height = 4.5, dpi = 150)
+```
+
+```{r comparison-table, eval=TRUE, echo=FALSE}
+tab(comparison, "Table 21 — Comparison of all three classification methods")
+```
+
+
+### Comparison by cross-validation
+
+| Method | CV F1 | Difference from the best |
+|---|---|---|
+| KNN | 0.9292 | — |
+| Random forest | 0.9244 | −0.0048 |
+| Decision tree | 0.8857 | −0.0435 |
+
+*Table 22: Comparison by the F1 measure from cross-validation*
+
+The comparison separates two clearly distinct situations.
+
+**The decision tree lags behind by more than four percentage points.** The
+difference is several times larger than the standard error across folds, which
+is approximately 0.007, so the finding is unambiguous.
+
+**The difference between KNN and the random forest cannot be considered real.**
+There are two reasons for this. The first is statistical: 0.0048 is less than
+one standard error, so the intervals overlap. The second is methodological —
+although an identical definition of the weighted F1 measure was deliberately
+applied for KNN, the two values **did not arise over the same folds**. For the
+tree and the forest the folds are formed by `ml_cross_validator` without
+stratification, for KNN by `caret::createFolds` with stratification. Comparing
+differences on the order of thousandths between two different folding schemes is
+not justified.
+
+The primary criterion therefore separates the tree from the other two methods,
+but **does not separate the random forest from KNN.**
+
+### Comparison on the test set
+
+| Indicator | Tree | Random forest | KNN |
+|---|---|---|---|
+| Accuracy | 0.9123 | **0.9415** | 0.9357 |
+| 95% confidence interval | 0.877–0.940 | 0.911–0.964 | 0.904–0.959 |
+| Cohen's kappa | 0.8926 | **0.9284** | 0.9214 |
+| Weighted F1 | 0.9131 | **0.9417** | 0.9359 |
+| Macro precision | 0.9276 | **0.9513** | 0.9398 |
+| Macro recall | 0.9191 | **0.9448** | 0.9447 |
+| Macro F1 | 0.9226 | **0.9476** | 0.9416 |
+| Balanced accuracy | 0.9504 | **0.9663** | 0.9658 |
+| Multiclass AUC | 0.9776 | **0.9966** | 0.9962 |
+| Number of errors (out of 342) | 30 | **20** | 22 |
+
+*Table 23: Comparison on the independent test set*
+
+The values of the weighted F1 measure on the test set were derived from the
+per-class F1 measures and the number of instances per class, in order to compare
+them with the measure from cross-validation, which is also weighted.
+
+**The ordering has reversed relative to cross-validation.** The random forest is
+better than KNN on all nine indicators, whereas in cross-validation it was
+second. The reversal is not in itself unusual — the test set comprises 342
+instances, so a difference of two misclassified instances shifts the accuracy by
+0.6 percentage points, and the confidence intervals overlap to a large extent.
+What is significant is the **consistency**: the forest is not better on average
+with random exceptions, but on every single indicator.
+
+| Class | Tree | Random forest | KNN |
+|---|---|---|---|
+| GK | 1.0000 | 1.0000 | 1.0000 |
+| CB | 0.9655 | **0.9744** | 0.9587 |
+| FB | 0.9385 | **0.9630** | 0.9538 |
+| DM_CM | 0.8846 | **0.9342** | 0.9324 |
+| AM_W | 0.8630 | 0.8966 | **0.9014** |
+| FW | 0.8837 | **0.9176** | 0.9032 |
+
+*Table 24: F1 measure by positional class, all three methods*
+
+Of the five non-trivial classes the random forest is the best in four, and KNN
+in one.
+
+### The structure of the errors — a shared ceiling
+
+| Class pair | Tree | Random forest | KNN |
+|---|---|---|---|
+| AM_W – FW | 10 | 7 | 9 |
+| DM_CM – AM_W | 9 | 7 | 4 |
+| FB – DM_CM | 6 | 2 | 3 |
+| CB – DM_CM | 3 | 1 | 3 |
+| CB – FB | 1 | 2 | 2 |
+| FB – AM_W | 1 | 1 | 1 |
+| **Total** | **30** | **20** | **22** |
+
+*Table 25: Distribution of the errors by class pair*
+
+This is the most informative part of the comparison. **All three methods make
+their errors in the same places.** Two pairs — wingers and forwards, and central
+and attacking midfielders — carry 63% of the errors for the tree, 70% for the
+forest and 59% for KNN. No method has a single error between classes at opposite
+ends of the defence–attack spectrum, and the goalkeeper class is left without a
+single error in all three cases.
+
+Three methods with fundamentally different inductive approaches — a single tree
+of rules, an ensemble of 500 trees and a distance-based method in a 29-dimensional
+space — produce **the same structure of errors.** If it were a matter of a
+capacity shortfall of an individual method, the distribution of the errors would
+differ. The consistency shows that the limit lies in the data itself, which is
+entirely consistent with the prediction from the principal component plot.
+
+The differences between the methods come down to how close they are to that
+shared ceiling. The tree is the furthest away. The forest and KNN are
+practically on it, with the forest separating wingers from forwards better (7
+versus 9), and KNN separating central from attacking midfielders better (4
+versus 7).
+
+### Comparison of feature importance
+
+```{r imp-all, eval=TRUE, echo=FALSE}
+tab(imp_all, "Table 26 — Feature importance across all three methods")
+```
+
+The three methods give three different rankings, and the differences are a
+consequence of the construction of the measures themselves. The random forest
+gives the list closest to the analysis of variance, the tree the most distorted
+one (60.3% in a single feature), and KNN a third one, different again, because
+the permutation measure underestimates correlated features. The common finding,
+despite the differences in ordering, is that **spatial features dominate in all
+three methods.**
+
+### Cost and behaviour as the data volume grows
+
+| Quantity | Tree | Random forest | KNN |
+|---|---|---|---|
+| Training a single model | 2.60 s | 6.21 s | 0.11 s |
+| Prediction over 342 instances | 0.50 s | 0.42 s | 0.32 s |
+| Number of models in the search | 273 | 263 | 451 |
+| Model size | 33 nodes | 21,544 nodes | 1360 × 29 matrix |
+| Environment | Spark MLlib | Spark MLlib | R, `kknn` |
+
+*Table 27: The cost of training and prediction*
+
+The most important difference for practical use is not visible from the measured
+values, because a set of 1,702 players is too small to expose it. **The cost of
+prediction for KNN grows linearly with the size of the training set**, since for
+every new instance the distance to all 1,360 reference points has to be
+computed. For the tree and the forest the cost of prediction **does not depend
+on the size of the training set** — it is determined by the number of trees and
+their depth. In addition, KNN has to keep the entire training set as its model;
+there is no compression of what has been learned into a more compact form.
+
+### The selected solution
+
+> **As the final solution across all methods, the random forest with 500 trees,
+> a maximum depth of 5 and the `sqrt` strategy for selecting the feature subset
+> was chosen.**
+
+The rationale, step by step:
+
+1. **The decision tree was ruled out on the basis of cross-validation.** A
+   shortfall of 0.0435 exceeds the standard error several times over and was
+   confirmed on the test set, where the tree makes 50% more errors.
+2. **Cross-validation did not separate the forest from KNN**, so the primary
+   criterion gives no answer and supplementary criteria are applied.
+3. **Consistency on the independent test set** — the forest is better on all
+   nine indicators and in four of the five non-trivial classes.
+4. **Behaviour as the data volume grows** — the cost of prediction for the
+   forest does not depend on the size of the training set, whereas for KNN it
+   grows linearly. For a project set up over gigabytes of data this is a
+   decisive property.
+5. **Interpretability** — the forest gives a feature importance measure
+   consistent with the analysis of variance, whereas the permutation-based
+   substitute for KNN proved distorted in the presence of correlated features.
+6. **Quality of the probability estimates** — the forest gives smoothly graded
+   probabilities, whereas for KNN they are multiples of 1/21.
+
+### Limitations of the choice
+
+The cross-validation folds are not identical for all three methods. Repeating
+the whole procedure over common, pre-fixed folds would remove this uncertainty
+and enable a paired comparison across folds, which is a considerably more
+sensitive procedure than comparing means.
+
+For the tree and the forest only the means across folds are available, since
+`ml_validation_metrics` does not return the dispersion. Confidence intervals
+from cross-validation were therefore computed only for KNN.
+
+The test set comprises 342 instances, so one misclassified instance changes the
+accuracy by 0.29 percentage points. The two-instance difference between the
+forest and KNN lies within that sensitivity.
+
+The parameter search was carried out by scenarios, as separate units, so none of
+the three solutions is necessarily the best possible one for that method.
+
+# Clustering
+
+## Setup
+
+Clustering is an unsupervised, descriptive procedure: the goal is not prediction
+but the description of a structure that exists in the data independently of the
+positional labels. What is grouped are the **instances**, i.e. the rows of the
+player-level table, not the features.
+
+The **k-means method** was applied, a representative of partitional clustering.
+Every player belongs to exactly one cluster, a cluster is represented by its
+centroid, and membership is determined by the Euclidean distance from the
+centroid.
+
+The choice of method was guided by computational complexity. The k-means method
+has complexity O(k·s·t), i.e. linear in the number of entities, while
+hierarchical clustering is between O(s² log s) and O(s³), and density-based
+clustering O(s log s). At the data volume this project was set up for, only the
+k-means method remains directly applicable and it is the only one with a
+distributed implementation in the Spark MLlib library.
+
+Unlike the k-nearest-neighbours method, where the Minkowski parameter was the
+subject of the third scenario, here the dissimilarity measure **is not a free
+parameter**: the method is defined via the Euclidean distance, since the
+centroid is computed as the arithmetic mean of the members. The metric therefore
+cannot be a scenario.
+
+The analysis was carried out over the **entire set of 1,702 players.** The split
+into a training and a test part was formed for the sake of classification and
+serves no purpose in an unsupervised procedure.
+
+```{r code-km-loading}
+train <- spark_read_parquet(sc, "train", sp("data/interim/train"))
+test  <- spark_read_parquet(sc, "test",  sp("data/interim/test"))
+dat   <- sdf_bind_rows(train, test)          # the whole dataset: 1702 players
+
+dat_r <- dat %>% select(all_of(c(feat_cols, "position_group"))) %>% collect()
+Xraw  <- as.matrix(dat_r[, feat_cols])
+poz   <- factor(dat_r$position_group, levels = lvl)   # ONLY for interpretation
+
+Xs <- scale(Xraw, center = TRUE, scale = TRUE)
+```
+
+Centring and scaling resolve the method's well-known sensitivity to feature
+scale: without them `passes_p90`, of the order of tens, would dominate the
+distance over shares in the range from 0 to 1. The Euclidean distance over
+standardised data is equivalent to the standardised Euclidean distance over the
+original values.
+
+Two feature spaces are prepared by separate pipelines. PCA is applied **to the
+standardised** data, since `ft_pca` does not centre on its own:
+
+```{r code-km-pipelines}
+prep_std <- ml_pipeline(sc) %>%
+  ft_vector_assembler(input_cols = feat_cols, output_col = "features_raw") %>%
+  ft_standard_scaler("features_raw", "features", with_mean = TRUE, with_std = TRUE)
+
+prep_pca <- ml_pipeline(sc) %>%
+  ft_vector_assembler(input_cols = feat_cols, output_col = "features_raw") %>%
+  ft_standard_scaler("features_raw", "features_std", with_mean = TRUE, with_std = TRUE) %>%
+  ft_pca(input_col = "features_std", output_col = "features", k = 11)
+
+tbl_std <- ml_transform(ml_fit(prep_std, dat), dat)
+tbl_pca <- ml_transform(ml_fit(prep_pca, dat), dat)
+```
+
+Two quantities were used as quality measures.
+
+**Within-cluster variability W(C)**, defined as the sum of squared Euclidean
+distances over all ordered pairs of entities within a cluster, divided by the
+number of members. The identity W(C) = 2·SSE(C) holds, because
+
+$$\sum_{i,j \in C} \lVert x_i - x_j \rVert^2 = 2\,\lvert C\rvert \sum_{i \in C} \lVert x_i - c \rVert^2 .$$
+
+```{r code-km-w}
+sse <- function(X, cl) {
+  sum(vapply(unique(cl), function(g) {
+    Xi <- X[cl == g, , drop = FALSE]
+    if (nrow(Xi) < 2) return(0)
+    sum(sweep(Xi, 2, colMeans(Xi))^2)
+  }, numeric(1)))
+}
+W_ukupno <- function(X, cl) 2 * sse(X, cl)
+
+# checking the identity: over all pairs versus over deviations from the centroid
+provera_W <- function(Xi) {
+  d2    <- as.matrix(dist(Xi))^2
+  W_par <- 2 * sum(d2[upper.tri(d2)]) / nrow(Xi)
+  W_sse <- 2 * sum(sweep(Xi, 2, colMeans(Xi))^2)
+  c(preko_parova = W_par, preko_sse = W_sse)
+}
+```
+
+The identity was checked numerically over the goalkeeper cluster: 1,806 both
+ways.
+
+**The silhouette coefficient** is computed with the `ml_clustering_evaluator`
+object. The adjusted Rand index and the purity measure were also computed, but
+**were not used as a selection criterion** — both rely on the positional labels,
+so using them when choosing the number of clusters would turn the procedure into
+a supervised one:
+
+```{r code-km-measures}
+evaluator_sil <- ml_clustering_evaluator(
+  sc, features_col = "features", prediction_col = "prediction",
+  metric_name = "silhouette")
+
+cistoca <- function(cl, klase) {              # purity
+  tab <- table(cl, klase); sum(apply(tab, 1, max)) / sum(tab)
+}
+
+ari <- function(cl, klase) {                 # adjusted Rand index
+  tab <- table(cl, klase); n <- sum(tab)
+  c2 <- function(x) x * (x - 1) / 2
+  suma_ij <- sum(c2(tab)); suma_i <- sum(c2(rowSums(tab)))
+  suma_j  <- sum(c2(colSums(tab)))
+  ocek <- suma_i * suma_j / c2(n)
+  (suma_ij - ocek) / (0.5 * (suma_i + suma_j) - ocek)
+}
+
+oceni_k <- function(tbl, X, k, oznaka, init_mode = "k-means||", seed = 42) {
+  model <- ml_kmeans(tbl, formula = NULL, k = k, features_col = "features",
+                     init_mode = init_mode, max_iter = 50, seed = seed)
+  tr <- ml_transform(model, tbl)
+  pr <- tr %>% select(prediction) %>% collect() %>% pull(prediction)
+  data.frame(prostor = oznaka, k = k,
+             W = round(W_ukupno(X, pr), 1), SSE = round(sse(X, pr), 1),
+             silueta = round(ml_evaluate(evaluator_sil, tr), 4),
+             najmanji = min(table(pr)), najveci = max(table(pr)),
+             cistoca = round(cistoca(pr, poz), 4),
+             ari = round(ari(pr, poz), 4))
+}
+```
+
+## Scenario 1 — number of clusters
+
+The number of clusters is the only parameter the method requires in advance, and
+that is its well-known drawback. Nine values were examined, from 2 to 10.
+
+```{r code-km-s1}
+K_RANGE <- 2:10
+vm1 <- bind_rows(lapply(K_RANGE, function(k) oceni_k(tbl_std, Xs, k, "29 obelezja")))
+
+# relative drop in W — a numerical complement to the visual elbow rule
+vm1 <- vm1 %>% mutate(pad_W = round(c(NA, -diff(W)) / lag(W) * 100, 1))
+```
+
+```{r km-s1, eval=TRUE, echo=FALSE}
+tab(km_s1, "Table 28 — k-means, scenario 1: number of clusters")
+```
+
+```{r km-s1-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 25: k-means, the elbow method and the silhouette coefficient"}
+knitr::include_graphics("figures/KM_S1.png")
+```
+
+**Both criteria point to the same value.** The elbow method: the drop in
+within-cluster variability is 26.8% when moving from two to three clusters, then
+12.9%, then 9.4%, and from there on it stays below six per cent. The elbow is
+clearly pronounced at **k = 3**. The silhouette coefficient independently
+reaches its maximum at the same value, 0.4760, with the second-best value being
+0.3850.
+
+The agreement of the two criteria is significant, since they measure different
+things: the elbow assesses cluster compactness, the silhouette the relation
+between compactness and separation. On the usual interpretation scale a value of
+0.4760 falls in the range of a weak but existing structure, which is a fair
+expectation for a dataset in which five of the six positional classes form a
+continuum.
+
+It is also observed that the smallest cluster has exactly 125 members at every
+value of k from 3 to 8 — as many as there are goalkeepers in the dataset.
+
+## Scenario 2 — feature space
+
+The pair `d3_share`–`mean_x` has a correlation coefficient of −0.980. In
+distance-based methods redundant features count the same information more than
+once and thereby implicitly weight it, changing the dissimilarity measure
+itself. The same range of k values was examined over 11 principal components,
+which carry 90.35% of the total variance and are orthogonal by construction.
+
+```{r code-km-s2}
+Xp <- prcomp(Xs, center = FALSE, scale. = FALSE)$x[, 1:11]
+vm2_pca <- bind_rows(lapply(K_RANGE, function(k) oceni_k(tbl_pca, Xp, k, "11 komponenti")))
+vm2 <- bind_rows(vm1 %>% select(-pad_W), vm2_pca)
+```
+
+```{r km-s2, eval=TRUE, echo=FALSE}
+tab(km_s2, "Table 29 — k-means, scenario 2: comparison of the feature spaces")
+```
+
+```{r km-s2-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 26: k-means, comparison of the two feature spaces"}
+knitr::include_graphics("figures/KM_S2.png")
+```
+
+**A note on the comparison:** the absolute values of W and SSE **are not
+comparable between the two spaces**, because 11 components contain only 90.35%
+of the total variance, so the total variability to be explained is also smaller.
+What is comparable is the normalised share of explained variability,
+1 − SSE(k)/SSE(1), where SSE(1) = 49,329 for the space of all features and
+44,569 for the space of components. At k = 3 that is 46.0% versus 50.8%. The
+silhouette coefficient and the Rand index are dimensionless and directly
+comparable.
+
+The finding is twofold.
+
+**Dimensionality reduction improves the quality of the partition.** The
+silhouette coefficient is higher in the space of components at all nine values
+of k, on average by 0.04. The explanation is precisely the one predicted in the
+section on correlations: by removing redundancy, every independent dimension of
+variability enters the distance exactly once.
+
+**The reduction does not change what the clusters capture.** At k = 3 the purity
+is identical (0.4636 in both cases), and the Rand index practically the same
+(0.3465 versus 0.3450). The structure is the same, only more clearly delineated
+in the space of components.
+
+Both spaces independently select k = 3, which confirms the choice from the first
+scenario.
+
+## Stability of the solution
+
+The k-means method converges to a local optimum and is sensitive to the initial
+configuration, so several runs with different initial states are recommended.
+
+```{r code-km-stability}
+stabilnost <- bind_rows(lapply(c("k-means||", "random"), function(im) {
+  bind_rows(lapply(c(1, 7, 42, 2024, 31337), function(s) {
+    r <- oceni_k(tbl_std, Xs, 3, "29 obelezja", init_mode = im, seed = s)
+    data.frame(init = im, seme = s, W = r$W, silueta = r$silueta, ari = r$ari)
+  }))
+}))
+```
+
+```{r km-stab, eval=TRUE, echo=FALSE}
+tab(km_stab, "Table 30 — Stability check of the solution at k = 3")
+```
+
+The range of the W values across all ten runs is **0.1**, and the range of the
+silhouette coefficient **0.0002**. The initialisation method made no difference.
+The solution is therefore completely stable and is not trapped in a poor local
+optimum.
+
+## The selected solution and the structure of the clusters
+
+**Three clusters over the space of all 29 standardised features** were selected.
+The number of clusters was confirmed three times over: by the elbow method, by
+the silhouette coefficient and by independent repetition in the space of
+principal components. The space of all features was retained for the structural
+analysis, even though the silhouette is higher in the space of components
+(0.5174 versus 0.4760), for the sake of interpretability — centroids in the
+space of the original features have a direct footballing meaning.
+
+```{r code-km-final}
+model <- ml_kmeans(tbl_std, formula = NULL, k = 3, features_col = "features",
+                   init_mode = "k-means||", max_iter = 50, seed = 42)
+
+klaster <- ml_transform(model, tbl_std) %>%
+  select(prediction) %>% collect() %>% pull(prediction)
+klaster <- factor(paste0("C", klaster + 1))     # C1..C3 instead of 0..2
+
+ukrstena <- table(klaster, poz)                 # only now are the positions used
+```
+
+```{r km-best, eval=TRUE, echo=FALSE}
+if (!is.null(km_best)) {
+  km_best |>
+    select(-any_of(c("silueta", "udeo_negativne"))) |>
+    tab("Table 31 — Indicators of the selected solution")
+}
+```
+
+| Cluster | Number of members | GK | CB | FB | DM_CM | AM_W | FW |
+|---|---|---|---|---|---|---|---|
+| C1 | 125 | **125** | 0 | 0 | 0 | 0 | 0 |
+| C2 | 966 | 0 | **300** | **325** | **320** | 21 | 0 |
+| C3 | 611 | 0 | 0 | 7 | 48 | **339** | **217** |
+
+*Table 32: The relation between the clusters and the positional classes*
+
+The purity is 0.4636 and the adjusted Rand index 0.3465. Both values appear low
+at first glance and, taken on their own, would lead to the wrong conclusion. The
+table shows the opposite.
+
+**No position is scattered across the clusters:**
+
+| Class | Dominant cluster | Share in it |
+|---|---|---|
+| GK | C1 | 100.0% |
+| CB | C2 | 100.0% |
+| FB | C2 | 97.9% |
+| DM_CM | C2 | 87.0% |
+| AM_W | C3 | 94.2% |
+| FW | C3 | 100.0% |
+
+*Table 33: Coverage of the positional classes by the dominant cluster*
+
+If the clusters are interpreted as supergroups — C1 goalkeepers, C2 the defence
+and the midfield, C3 the attack — then **1,626 of the 1,702 players, i.e. 95.5%,
+belong to the cluster corresponding to their supergroup.**
+
+Low purity therefore does not mean disagreement but **the coarseness of the
+partition.** For each cluster the purity measure takes the share of the most
+numerous class only, so cluster C2, which contains three positional classes in
+roughly equal measure (CB 31.1%, FB 33.6%, DM_CM 33.1%), receives a score of
+just 33.6% even though it contains no foreign element other than 21 attacking
+midfielders. The same holds for the Rand index, which penalises the merging of
+classes even when the merging is entirely consistent.
+
+The essential finding is that **the unsupervised procedure discovers three
+supergroups rather than six positions, and that those supergroups are nested
+within the positional ordering without crossing it.** The boundary between C2
+and C3 runs between the central and the attacking midfielders, i.e. in the
+middle of the defence–attack spectrum.
+
+```{r km-pca-clusters, eval=TRUE, echo=FALSE, fig.cap="Figure 27: The clusters in the space of the principal components"}
+knitr::include_graphics("figures/KM_pca_klasteri.png")
+```
+
+```{r km-pca-positions, eval=TRUE, echo=FALSE, fig.cap="Figure 28: The same points coloured by positional class"}
+knitr::include_graphics("figures/KM_pca_pozicije.png")
+```
+
+A comparison of the two figures shows most directly what the clusters capture:
+the arrangement of the points is the same, and the colours differ only in that
+the clustering merges neighbouring positional classes into supergroups.
+
+The relation between the silhouette and the Rand index expresses the same thing
+numerically. The silhouette coefficient, an unsupervised measure, has its
+maximum at k = 3. The adjusted Rand index, which measures agreement with the
+positions, has its maximum at **k = 7** (0.6598), where the purity reaches
+0.8719. **Agreement with the positional labels requires more clusters than the
+density structure offers.** The two curves have their maxima in different
+places, and that divergence is the main quantitative result of this part.
+
+```{r km-silhouette, eval=TRUE, echo=FALSE, fig.cap="Figure 29: Silhouette profile of the selected solution"}
+knitr::include_graphics("figures/KM_silueta.png")
+```
+
+The goalkeeper cluster has a markedly high mean silhouette, while C2 and C3 are
+considerably lower — as expected, since they share a boundary that is not sharp
+in the data. The share of instances with a negative silhouette is below one per
+cent, which means that almost no player is obviously misplaced.
+
+## The relation between feature values and cluster membership
+
+Which features determine the partition is established by a one-way analysis of
+variance with the cluster as the factor, and the profile is displayed as a heat
+map of the centroids:
+
+```{r code-km-profiles}
+f_vred <- vapply(feat_cols, function(f)
+  summary(aov(Xs[, f] ~ klaster))[[1]][["F value"]][1], numeric(1))
+f_df <- data.frame(obelezje = names(f_vred), F_vrednost = round(f_vred, 1)) %>%
+  arrange(desc(F_vrednost))
+
+centroidi <- as.data.frame(t(sapply(levels(klaster), function(g)
+  colMeans(Xs[klaster == g, , drop = FALSE]))))
+centroidi$klaster <- rownames(centroidi)
+
+top_f <- head(f_df$obelezje, 15)
+centroidi %>%
+  select(klaster, all_of(top_f)) %>%
+  pivot_longer(-klaster, names_to = "obelezje", values_to = "z") %>%
+  mutate(obelezje = factor(obelezje, levels = rev(top_f))) %>%
+  ggplot(aes(klaster, obelezje, fill = z)) +
+  geom_tile() + geom_text(aes(label = sprintf("%.1f", z)), size = 2.8) +
+  scale_fill_gradient2(low = "steelblue4", mid = "white", high = "firebrick",
+                       midpoint = 0) +
+  labs(title = "Cluster profiles",
+       subtitle = "Centroids in standardised units; 0 is the mean of the whole dataset",
+       x = "Cluster", y = NULL, fill = "z")
+ggsave("figures/KM_centroidi.png", width = 7.5, height = 6.5, dpi = 150)
+```
+
+```{r km-features, eval=TRUE, echo=FALSE}
+if (!is.null(km_features)) {
+  km_features |> head(12) |>
+    tab("Table 34 — The features that separate the clusters most (ANOVA F)")
+}
+```
+
+The first six features coincide, in a changed order, with the first seven by
+discriminative power with respect to position. The groups the algorithm found
+are therefore not defined by some hidden feature, but by the very same
+quantities that separate the positions as well — only more coarsely.
+
+In first place is `avg_pass_length`, a feature that the selected decision tree
+did not use even once, because in the presence of `mean_x` it was redundant.
+Here it is the strongest, because clustering does not choose one feature per
+split but uses all of them simultaneously through the Euclidean distance.
+Goalkeepers with their long clearances and forwards with short passes in tight
+spaces lie at opposite ends of that axis.
+
+```{r km-centroids-fig, eval=TRUE, echo=FALSE, fig.cap="Figure 30: Cluster profiles — centroids in standardised units"}
+knitr::include_graphics("figures/KM_centroidi.png")
+```
+
+The cluster profile has a clear structure along two axes.
+
+**The spatial axis** separates all three clusters: `mean_x`, `d3_share` and
+`f3_share` change sign and magnitude from C1 through C2 to C3, following the
+shift of the centre of gravity from one's own goal towards the opposition goal.
+
+**The axis of risk in possession** separates mainly C2 from C3. The features
+`miscontrols_p90` and `dispossessed_p90` are high on the list, above
+`shots_p90`. Players in the attacking third lose the ball considerably more
+often, because they receive it under pressure, in tight spaces and with their
+back to goal. That is a feature of behaviour rather than of position, and it
+constitutes a second independent source of separation.
+
+```{r km-centroids-table, eval=TRUE, echo=FALSE}
+if (!is.null(km_centroids)) {
+  km_centroids |>
+    select(any_of(c("klaster", "n", "mean_x", "d3_share", "f3_share",
+                    "avg_pass_length", "miscontrols_p90", "shots_p90"))) |>
+    tab("Table 35 — Centroids in the original units (selected features)", digits = 2)
+}
+```
+
+```{r km-composition, eval=TRUE, echo=FALSE, fig.cap="Figure 31: Composition of the clusters by positional class"}
+knitr::include_graphics("figures/KM_sastav.png")
+```
+
+```{r km-boxplot, eval=TRUE, echo=FALSE, fig.cap="Figure 32: Distribution of the features across the clusters"}
+knitr::include_graphics("figures/KM_boxplot.png")
+```
+
+The box plots in the original units confirm that the separation is not the
+consequence of individual outlying values but of a shift of whole distributions.
+
+# Conclusion
+
+5,321,459 events from 1,517 matches in four European leagues were analysed,
+aggregated into a player-level table with 1,702 rows and 29 numeric features.
+
+**Spatial features determine position.** The analysis of variance showed that
+the strongest spatial feature has 5.6 times the discriminative power of the
+strongest event counter. The same finding is confirmed independently by all
+three classification methods through their feature importance measures, and by
+the clustering as well. A player's position is read more reliably from where the
+player moves than from which actions they perform.
+
+**The selected classification solution is the random forest** with 500 trees, a
+depth of 5 and the `sqrt` strategy, which on the test set achieves an accuracy
+of 0.9415, Cohen's kappa of 0.9284, a macro F1 measure of 0.9476 and a
+multiclass AUC of 0.9966. Cross-validation did not separate the forest from the
+k-nearest-neighbours method, so the choice was supplemented by consistency on
+the test set, behaviour as the data volume grows, and interpretability.
+
+**Positional roles are a continuum, not discrete categories.** This finding
+appears four times independently: in the principal component plot, in the
+structure of the errors of all three classifiers, in the divergence of the
+silhouette coefficient and the Rand index in the clustering, and in the
+composition of the resulting clusters. The unsupervised procedure recognises
+three supergroups — goalkeepers, players with their centre of gravity in their
+own half, and players with their centre of gravity in the opposition half — with
+95.5% agreement, but not six individual positions.
+
+**The remaining error is a property of the data, not of the methods.** All three
+classifiers make errors on the same class pairs, in the same arrangement, and
+none confuses classes at opposite ends of the spectrum. Progress beyond the
+level achieved would more likely come from work on the features than from
+further parameter tuning.
+
+# Limitations
+
+1. The target classes were derived from the modal position, so 25
+   multi-positional players (1.5% of the dataset) have a less reliable label.
+2. The models use season-level aggregates and do not take into account the
+   context of an individual match or the opponent.
+3. The spatial features are based on mean coordinates and dispersion, so the
+   detailed structure of movement is lost.
+4. No method was examined over a full combinatorial grid of hyperparameters. For
+   the random forest this was even shown concretely: the combination of a large
+   number of trees and a depth of 10 was not examined, and both scenarios
+   suggest it as probably more favourable.
+5. The cross-validation folds are not identical for all three methods — Spark
+   splits at random, `caret::createFolds` stratifies.
+6. The k-means method forms spherical clusters of approximately equal size. A
+   density-based procedure would give complementary insight, but it has no
+   distributed implementation in MLlib.
+7. The clustering was performed over a set of features chosen according to their
+   discriminative power with respect to position, which is a supervised
+   criterion. An unsupervised analysis over a differently chosen set could
+   reveal structure that has nothing to do with position.
+8. A comparison with the bisecting k-means method was also attempted, which is
+   interesting because bisections at the same level of the hierarchy are
+   mutually independent and can be executed in parallel. The function
+   `ml_bisecting_kmeans` in the version of the `sparklyr` package used returned
+   a single cluster instead of the three requested, so the comparison was not
+   carried out.
+
+Possible improvements: more seasons, features by phase of play, the context of
+the match score, a comparison with density-based clustering methods, and the
+application of gradient boosting methods.
+
+# Reproducibility
+
+All scripts use a fixed seed of 42. Order of execution:
+
+```{r reproducibility}
+source("scripts/00_preuzmi_podatke.R")                 # data download
+source("scripts/01_data_processing_with_sparklyr.R")   # Spark processing, features
+source("scripts/03_null_values_analysis.R")            # missing values
+source("scripts/04_EDA.R")                             # preliminary analysis
+source("scripts/05_train_test_split.R")                # split into training and test
+source("scripts/06_decision_tree.R")                   # decision tree
+source("scripts/07_random_forest.R")                   # random forest
+source("scripts/08_knn.R")                             # k nearest neighbours
+source("scripts/09_kmeans.R")                          # clustering
+```
+
+The report is knitted with `rmarkdown::render("documentation.Rmd")`. The blocks
+that start Spark are marked `eval = FALSE`; the tables are read from `results/`
+and the figures from `figures/`, so knitting does not require the analysis to be
+run again.
+
+```{r session, eval=TRUE}
+sessionInfo()
+```
+
+# Appendix: the complete scripts
+
+```{r appendix, eval=TRUE, echo=FALSE, results='asis'}
+skripte <- c(
+  "scripts/00_preuzmi_podatke.R",
+  "scripts/01_data_processing_with_sparklyr.R",
+  "scripts/03_null_values_analysis.R",
+  "scripts/04_EDA.R",
+  "scripts/05_train_test_split.R",
+  "scripts/06_decision_tree.R",
+  "scripts/07_random_forest.R",
+  "scripts/08_knn.R",
+  "scripts/09_kmeans.R"
+)
+
+for (put in skripte) {
+  cat("\n\n## `", basename(put), "`\n\n", sep = "")
+  if (file.exists(put)) {
+    cat("```r\n"); cat(readLines(put), sep = "\n"); cat("\n```\n")
+  } else {
+    cat("*File not found: `", put, "`*\n", sep = "")
+  }
+}
+```
+
+# References
+
+1. StatsBomb. *StatsBomb Open Data*. <https://github.com/statsbomb/open-data>
+2. Apache Spark. *MLlib: Machine Learning Library*. <https://spark.apache.org/mllib/>
+3. Breiman, L. (2001). *Random Forests*. Machine Learning, 45(1), 5–32.
+4. Cover, T. and Hart, P. (1967). *Nearest Neighbor Pattern Classification*. IEEE Transactions on Information Theory, 13(1), 21–27.
+5. MacQueen, J. (1967). *Some Methods for Classification and Analysis of Multivariate Observations*.
+6. Hand, D. J. and Till, R. J. (2001). *A Simple Generalisation of the Area Under the ROC Curve for Multiple Class Classification Problems*. Machine Learning, 45, 171–186.
+7. Rousseeuw, P. J. (1987). *Silhouettes: a graphical aid to the interpretation and validation of cluster analysis*. Journal of Computational and Applied Mathematics, 20, 53–65.
+8. Kuhn, M. *caret: Classification and Regression Training*.
+9. Hechenbichler, K. and Schliep, K. *kknn: Weighted k-Nearest Neighbors*.
